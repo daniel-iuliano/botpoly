@@ -29,25 +29,17 @@ async function fetchWithRetry<T>(fn: () => Promise<T>, maxRetries = 3, initialDe
 export const generateMarketSignal = async (market: Market): Promise<Signal> => {
   return fetchWithRetry(async () => {
     try {
-      // Obtain the API key from the environment.
-      // We check this inside the function to avoid crashing the whole app on load
-      // if the key is missing or provided asynchronously by the environment.
-      const apiKey = process.env.API_KEY;
-      
-      if (!apiKey) {
-        throw new Error("Gemini API_KEY is undefined. Please ensure the environment variable is set.");
-      }
-
-      // Initialize the API client right before the call.
-      const ai = new GoogleGenAI({ apiKey });
+      // Fix: Initialize the API client directly using the environment variable as per guidelines.
+      const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
 
       const prompt = `Analyze the probability of this prediction market outcome: "${market.question}".
       Description: ${market.description}
       Provide a quantitative probability estimate based on the latest available news and search data.
       Be objective and look for contrarian data points. Respond in JSON format.`;
 
+      // Fix: Using gemini-3-pro-preview for complex reasoning and quantitative analysis tasks.
       const response = await ai.models.generateContent({
-        model: "gemini-3-flash-preview",
+        model: "gemini-3-pro-preview",
         contents: prompt,
         config: {
           tools: [{ googleSearch: {} }],
@@ -73,7 +65,7 @@ export const generateMarketSignal = async (market: Market): Promise<Signal> => {
         }
       });
 
-      // Directly access .text property from GenerateContentResponse
+      // Fix: Directly access .text property from GenerateContentResponse (do not use .text())
       const text = response.text?.trim() || '{}';
       const data = JSON.parse(text);
       
