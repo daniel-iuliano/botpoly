@@ -2,9 +2,6 @@
 import { GoogleGenAI, Type } from "@google/genai";
 import { Market, Signal } from "../types";
 
-// Initialize with named parameter and process.env.API_KEY
-const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
-
 const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
 async function fetchWithRetry<T>(fn: () => Promise<T>, maxRetries = 3, initialDelay = 3000): Promise<T> {
@@ -32,13 +29,24 @@ async function fetchWithRetry<T>(fn: () => Promise<T>, maxRetries = 3, initialDe
 export const generateMarketSignal = async (market: Market): Promise<Signal> => {
   return fetchWithRetry(async () => {
     try {
+      // Obtain the API key from the environment.
+      // We check this inside the function to avoid crashing the whole app on load
+      // if the key is missing or provided asynchronously by the environment.
+      const apiKey = process.env.API_KEY;
+      
+      if (!apiKey) {
+        throw new Error("Gemini API_KEY is undefined. Please ensure the environment variable is set.");
+      }
+
+      // Initialize the API client right before the call.
+      const ai = new GoogleGenAI({ apiKey });
+
       const prompt = `Analyze the probability of this prediction market outcome: "${market.question}".
       Description: ${market.description}
       Provide a quantitative probability estimate based on the latest available news and search data.
       Be objective and look for contrarian data points. Respond in JSON format.`;
 
       const response = await ai.models.generateContent({
-        // Switched to gemini-3-flash-preview for higher rate limits and better performance in loops
         model: "gemini-3-flash-preview",
         contents: prompt,
         config: {
@@ -65,11 +73,11 @@ export const generateMarketSignal = async (market: Market): Promise<Signal> => {
         }
       });
 
-      // Directly access .text property
+      // Directly access .text property from GenerateContentResponse
       const text = response.text?.trim() || '{}';
       const data = JSON.parse(text);
       
-      // Extract search URLs
+      // Extract search URLs for grounding
       const sources = response.candidates?.[0]?.groundingMetadata?.groundingChunks?.map((chunk: any) => ({
         title: chunk.web?.title || 'Source',
         uri: chunk.web?.uri || '#'
@@ -83,7 +91,7 @@ export const generateMarketSignal = async (market: Market): Promise<Signal> => {
         sources: sources
       };
     } catch (error) {
-      console.error("Signal generation failed after retries:", error);
+      console.error("Signal generation failed:", error);
       throw error;
     }
   });
