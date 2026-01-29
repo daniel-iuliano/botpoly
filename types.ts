@@ -1,5 +1,5 @@
 
-export type BotStep = 'IDLE' | 'SCANNING' | 'ANALYZING' | 'RISK_CHECK' | 'EXECUTING' | 'MONITORING' | 'COOLING';
+export type BotStep = 'IDLE' | 'SCANNING' | 'ANALYZING' | 'RISK_CHECK' | 'EXECUTING' | 'MONITORING' | 'COOLING' | 'EXHAUSTED';
 
 export type WalletType = 'METAMASK' | 'PHANTOM' | 'TRUST' | 'WALLETCONNECT';
 
@@ -41,6 +41,9 @@ export interface BotStats {
   totalTrades: number;
   activeExposure: number;
   balance: number;
+  initialBalance: number;
+  allocatedCapital: number;
+  cumulativeSpent: number;
 }
 
 export interface LogEntry {
