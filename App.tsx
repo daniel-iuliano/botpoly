@@ -18,7 +18,7 @@ const INITIAL_STATS: BotStats = {
   maticBalance: 0, initialUsdcBalance: 0, allocatedCapital: 0, cumulativeSpent: 0
 };
 
-const SCAN_INTERVAL = 30000;
+const SCAN_INTERVAL = 20000; // Stabilized to 20s
 
 const App: React.FC = () => {
   const [isRunning, setIsRunning] = useState(false);
@@ -31,7 +31,7 @@ const App: React.FC = () => {
   const [stats, setStats] = useState<BotStats>(INITIAL_STATS);
   const [activeTrades, setActiveTrades] = useState<Trade[]>([]);
   const [logs, setLogs] = useState<LogEntry[]>([
-    { timestamp: Date.now(), level: 'INFO', message: 'PolyQuant-X Kernel Initialized.' }
+    { timestamp: Date.now(), level: 'INFO', message: 'CLOB Core V5.2.0 initialized. Awaiting deployment.' }
   ]);
   
   const botTimeoutRef = useRef<any>(null);
@@ -62,11 +62,11 @@ const App: React.FC = () => {
 
   const connectWallet = async (type: WalletType) => {
     setIsConnecting(true);
-    addLog('INFO', `Connecting ${type}...`);
+    addLog('INFO', `Initializing handshake with ${type}...`);
     try {
       const win = window as any;
       const rawProvider = type === 'METAMASK' ? win.ethereum : win.phantom?.ethereum || win.trustwallet;
-      if (!rawProvider) throw new Error(`${type} not detected.`);
+      if (!rawProvider) throw new Error(`${type} extension not found.`);
       const provider = new BrowserProvider(rawProvider);
       const accounts = await provider.send("eth_requestAccounts", []);
       providerRef.current = provider;
@@ -75,7 +75,7 @@ const App: React.FC = () => {
       if (bals) {
         setIsConnected(true);
         setShowWalletSelector(false);
-        addLog('SUCCESS', `Wallet connected. Liquid Capital: $${bals.totalUsdc.toFixed(2)}`);
+        addLog('SUCCESS', `Connected: ${accounts[0].slice(0,6)}... Session Active.`);
       }
     } catch (error: any) {
       addLog('ERROR', error.message);
@@ -83,43 +83,46 @@ const App: React.FC = () => {
   };
 
   const runIteration = useCallback(async () => {
-    // Check execution lock and global run state
     if (!isRunning || isExecutingRef.current || !address || !providerRef.current) return;
     
     isExecutingRef.current = true;
     try {
-      // 1. Snapshot State
       const currentBals = await fetchBalances(address, providerRef.current);
-      if (!currentBals) throw new Error("Balance sync failed.");
+      if (!currentBals) throw new Error("Wallet state sync failed.");
 
-      // 2. Discover Tradable Markets
+      // STEP 1: Strict CLOB Discovery
       setCurrentStep('SCANNING');
-      addLog('INFO', 'Scanning CLOB for tradable opportunities...');
-      const { markets, totalFetched, discardedClosed, discardedNoBook } = await fetchLiveMarkets();
+      addLog('INFO', 'Scanning CLOB for active tradable markets...');
+      const { markets, stats: scanStats } = await fetchLiveMarkets();
       
-      if (totalFetched === 0) {
-        addLog('WARNING', 'CLOB returned 0 markets. API might be rate-limiting or down.');
+      if (scanStats.total === 0) {
+        addLog('WARNING', 'No data from CLOB discovery endpoint. Retrying in 20s.');
       } else {
-        addLog('INFO', `Scan Report: ${totalFetched} found. Tradable: ${markets.length} | Closed: ${discardedClosed} | NoBook: ${discardedNoBook}`);
+        addLog('INFO', `Scanner: Discovered ${scanStats.tradable} tradable candidates. (Discarded ${scanStats.discarded} closed/archived)`);
       }
 
       if (markets.length > 0) {
         let tradeExecuted = false;
-        // Prioritize first 5 for analysis to respect Gemini rate limits
+        // Focus on top 5 tradable markets to respect Gemini rate limits
         const candidates = markets.slice(0, 5); 
 
         for (const m of candidates) {
           if (tradeExecuted || !isRunning) break;
 
-          // Validate L2 Depth
+          // STEP 2: Layer 2 Order Book Validation
           const book = await fetchOrderbook(m.yesTokenId);
-          if (!book || !validateLiquidity(book, 10)) {
+          if (!book) continue;
+
+          const isLiquid = validateLiquidity(book, 10);
+          if (!isLiquid) {
             continue; 
           }
 
+          addLog('SIGNAL', `Tradable confirmed: ${m.id.slice(0,8)} | Spread: ${(book.spread*100).toFixed(2)}%`);
           m.currentPrice = book.midPrice;
+
+          // STEP 3: Execution ONLY after confirm
           setCurrentStep('ANALYZING');
-          
           try {
             const signal = await generateMarketSignal(m);
             setCurrentStep('RISK_CHECK');
@@ -129,7 +132,7 @@ const App: React.FC = () => {
               const size = calculateKellySize(m.currentPrice, signal.impliedProbability, stats.usdcBalance);
               if (size >= 1) { 
                 setCurrentStep('EXECUTING');
-                addLog('SUCCESS', `Signal Detected: ${m.id.slice(0,8)}. Edge: ${(ev*100).toFixed(1)}%. Order: $${size.toFixed(2)}`);
+                addLog('SUCCESS', `Execution: ${m.id.slice(0,8)} | Size $${size.toFixed(2)} | Edge ${(ev*100).toFixed(1)}%`);
                 
                 const newTrade: Trade = {
                   id: `tx-${Date.now()}`, 
@@ -145,7 +148,6 @@ const App: React.FC = () => {
                 };
 
                 setActiveTrades(prev => [newTrade, ...prev].slice(0, 10));
-
                 setStats(prev => ({
                   ...prev, 
                   cumulativeSpent: prev.cumulativeSpent + size,
@@ -155,37 +157,35 @@ const App: React.FC = () => {
                 tradeExecuted = true;
               }
             }
-          } catch (e) { /* Signal failure is non-fatal */ }
+          } catch (e) { /* Analysis failed - non fatal */ }
           
-          // Small delay between book/signal checks to avoid IP bans
-          await new Promise(r => setTimeout(r, 400)); 
+          await new Promise(r => setTimeout(r, 300)); // Respect CLOB rate limits
         }
+      } else if (scanStats.total > 0) {
+        addLog('WARNING', 'No tradable markets passing CLOB safety filters. Retrying in 20s.');
       }
     } catch (error: any) {
-      addLog('ERROR', 'Iteration Kernel Failure.', error.message);
+      addLog('ERROR', 'Kernel fault detected.', error.message);
     } finally {
       isExecutingRef.current = false;
       setCurrentStep('MONITORING');
-      // Explicitly check isRunning again before queuing next iteration
       if (isRunning) {
         if (botTimeoutRef.current) clearTimeout(botTimeoutRef.current);
         botTimeoutRef.current = setTimeout(runIteration, SCAN_INTERVAL);
       }
     }
-    // We intentionally omit stats dependencies from the useCallback to keep the loop stable.
-    // Instead, we use the latest state values via functional updates or state snapshots.
   }, [isRunning, address, addLog]);
 
   useEffect(() => {
     if (isRunning) {
-      addLog('INFO', `Agent Active. Scan interval: ${SCAN_INTERVAL/1000}s`);
+      addLog('SUCCESS', 'Agent active on Polygon Mainnet.');
       runIteration();
     } else {
       if (botTimeoutRef.current) clearTimeout(botTimeoutRef.current);
       setCurrentStep('IDLE');
     }
     return () => { if (botTimeoutRef.current) clearTimeout(botTimeoutRef.current); };
-  }, [isRunning]); // Strictly triggers only on start/stop toggle
+  }, [isRunning]);
 
   const startBot = () => {
     if (!isConnected || stats.usdcBalance <= 0) return;
@@ -207,7 +207,7 @@ const App: React.FC = () => {
             <BrainCircuit className="text-white w-8 h-8" />
           </div>
           <div>
-            <h1 className="text-2xl font-black tracking-tighter italic text-white">POLYQUANT-X <span className="text-[10px] not-italic font-bold bg-amber-500 text-black px-2 py-0.5 rounded ml-2 uppercase tracking-widest">CLOB CORE</span></h1>
+            <h1 className="text-2xl font-black tracking-tighter italic text-white">POLYQUANT-X <span className="text-[10px] not-italic font-bold bg-amber-500 text-black px-2 py-0.5 rounded ml-2 uppercase tracking-widest text-center">CLOB ENGINE</span></h1>
             <div className="flex items-center gap-3 mt-1">
                <span className={`text-[9px] font-mono uppercase tracking-widest ${isRunning ? 'text-emerald-500 animate-pulse' : 'text-gray-500'}`}>
                 {isRunning ? 'Kernel: Active' : 'Kernel: Idle'}
@@ -224,19 +224,19 @@ const App: React.FC = () => {
           {isConnected && !isRunning && (
             <div className="flex flex-col min-w-[200px] gap-2">
               <div className="flex justify-between text-[10px] uppercase font-bold text-gray-400">
-                <span>Allocation</span>
+                <span>Deployment Allocation</span>
                 <span className="text-blue-400">{allocationPercent}% (${(stats.usdcBalance * allocationPercent / 100).toFixed(2)})</span>
               </div>
               <input type="range" min="0" max="100" step="5" value={allocationPercent} onChange={(e) => setAllocationPercent(parseInt(e.target.value))} className="w-full h-1.5 bg-white/10 rounded-lg appearance-none cursor-pointer accent-blue-500" />
             </div>
           )}
           {!isConnected ? (
-            <button onClick={() => setShowWalletSelector(true)} disabled={isConnecting} className="px-8 py-3 bg-blue-600 hover:bg-blue-500 text-white rounded-2xl font-bold transition-all flex items-center gap-3 active:scale-95">
-              {isConnecting ? 'Connecting...' : <><span className="opacity-50">{ICONS.Wallet}</span> CONNECT</>}
+            <button onClick={() => setShowWalletSelector(true)} disabled={isConnecting} className="px-8 py-3 bg-blue-600 hover:bg-blue-500 text-white rounded-2xl font-bold transition-all flex items-center gap-3 active:scale-95 shadow-lg shadow-blue-500/20">
+              {isConnecting ? 'Connecting...' : <><span className="opacity-50">{ICONS.Wallet}</span> CONNECT MAINNET</>}
             </button>
           ) : (
             <button onClick={() => isRunning ? setIsRunning(false) : startBot()} disabled={!isRunning && stats.usdcBalance <= 0} className={`px-10 py-3 rounded-2xl font-black tracking-widest transition-all active:scale-95 ${isRunning ? 'bg-rose-500/10 text-rose-500 border border-rose-500/20' : 'bg-emerald-600 text-white shadow-xl shadow-emerald-900/30'}`}>
-              {isRunning ? 'STOP AGENT' : 'START AGENT'}
+              {isRunning ? 'STOP KERNEL' : 'DEPLOY AGENT'}
             </button>
           )}
         </div>
@@ -250,21 +250,26 @@ const App: React.FC = () => {
             <h3 className="text-lg font-bold flex items-center gap-3"><ShieldAlert className="text-amber-500 w-5 h-5" /> Execution Guard</h3>
             <div className="space-y-4">
               <div className="p-4 rounded-xl bg-blue-500/5 border border-blue-500/10">
-                <span className="text-[9px] text-gray-500 uppercase block mb-1">Tradability Check</span>
-                <span className="text-sm font-bold text-blue-400">CLOB Discovery</span>
-                <p className="text-[10px] text-gray-500 mt-1 italic leading-tight">Scanner enforces accepting_orders and enable_order_book flags.</p>
+                <span className="text-[9px] text-gray-500 uppercase block mb-1">Tradability Filter</span>
+                <span className="text-sm font-bold text-blue-400">CLOB Direct</span>
+                <p className="text-[10px] text-gray-500 mt-1 italic leading-tight">Bot scans exclusively for markets with active_orders and orderbook_enabled flags.</p>
+              </div>
+              <div className="p-4 rounded-xl bg-emerald-500/5 border border-emerald-500/10">
+                <span className="text-[9px] text-gray-500 uppercase block mb-1">L2 Validation</span>
+                <span className="text-sm font-bold text-emerald-400">Orderbook Depth</span>
+                <p className="text-[10px] text-gray-500 mt-1 italic leading-tight">Before analysis, the bot verifies live Bids and Asks on the target token.</p>
               </div>
               <div className="p-4 rounded-xl bg-amber-500/5 border border-amber-500/10">
-                <span className="text-[9px] text-gray-500 uppercase block mb-1">Execution Limit</span>
-                <span className="text-sm font-bold text-amber-500">Spread &lt; 5%</span>
-                <p className="text-[10px] text-gray-500 mt-1 italic leading-tight">Prevailing market spread is verified against orderbook depth before analysis.</p>
+                <span className="text-[9px] text-gray-500 uppercase block mb-1">Cycle Policy</span>
+                <span className="text-sm font-bold text-amber-500">20s Polling</span>
+                <p className="text-[10px] text-gray-500 mt-1 italic leading-tight">Stable iteration frequency enforced to prevent rate-limiting and loop drift.</p>
               </div>
             </div>
           </div>
         </div>
       </main>
-      <footer className="text-center text-gray-600 text-[10px] uppercase tracking-[0.3em] font-mono border-t border-white/5 pt-8">
-        &copy; 2025 POLYQUANT-X // STABLE_KERNEL_V5 // v5.2.0-PROD
+      <footer className="text-center text-gray-600 text-[10px] uppercase tracking-[0.3em] font-mono border-t border-white/5 pt-8 pb-4">
+        &copy; 2025 POLYQUANT-X // STABLE_KERNEL_V5 // v5.3.0-PROD
       </footer>
     </div>
   );
