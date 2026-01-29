@@ -8,6 +8,7 @@ const POLYMARKET_CLOB_API = "https://clob.polymarket.com";
  * Calculates the Expected Value (EV) of a YES position.
  */
 export const calculateEV = (marketPrice: number, estimatedProb: number): number => {
+  if (marketPrice <= 0 || marketPrice >= 1) return 0;
   const profitOnWin = 1 - marketPrice;
   const lossOnLoss = marketPrice;
   return (estimatedProb * profitOnWin) - ((1 - estimatedProb) * lossOnLoss);
@@ -21,6 +22,7 @@ export const calculateKellySize = (
   estimatedProb: number, 
   balance: number
 ): number => {
+  if (marketPrice <= 0 || marketPrice >= 1) return 0;
   const b = (1 / marketPrice) - 1;
   const p = estimatedProb;
   const q = 1 - p;
@@ -37,31 +39,44 @@ export const calculateKellySize = (
 
 /**
  * Fetches real production market data from Polymarket CLOB.
+ * Uses specific filtering for active, tradeable tokens.
  */
 export const fetchLiveMarkets = async (): Promise<Market[]> => {
   try {
-    // Note: Polymarket CLOB API often requires specific query params for active liquid markets.
-    // Fetching a subset of active markets.
-    const response = await fetch(`${POLYMARKET_CLOB_API}/markets?next_cursor=`);
+    // Fetch active markets with volume filtering if possible
+    const response = await fetch(`${POLYMARKET_CLOB_API}/markets?active=true`);
     if (!response.ok) throw new Error("Failed to fetch from Polymarket CLOB API");
     
     const data = await response.json();
     const rawMarkets = data.data || [];
 
-    // Filter for liquid markets (USDC markets usually have price data available)
+    // Filter for liquid markets (must have outcomes and be active)
     return rawMarkets
-      .filter((m: any) => m.active && m.order_price_min_tick && m.outcomes)
-      .slice(0, 15)
-      .map((m: any) => ({
-        id: m.condition_id || m.id,
-        question: m.question,
-        category: m.group_item_title || "General",
-        volume: parseFloat(m.volume || "0"),
-        currentPrice: 0.5, // Defaulting if not in basic endpoint, real bot would check orderbook
-        outcomes: JSON.parse(m.outcomes || '["YES", "NO"]'),
-        lastUpdated: Date.now(),
-        description: m.description || ""
-      }));
+      .filter((m: any) => 
+        m.active === true && 
+        m.closed === false &&
+        m.outcomes && 
+        m.question
+      )
+      .sort((a: any) => (a.volume_24h ? -1 : 1)) // Prioritize high volume
+      .slice(0, 20)
+      .map((m: any) => {
+        // Extract current price from the CLOB token data if available
+        // Usually YES is index 0, NO is index 1
+        const tokens = m.tokens || [];
+        const yesPrice = tokens[0]?.price ? parseFloat(tokens[0].price) : 0.5;
+
+        return {
+          id: m.condition_id || m.id,
+          question: m.question,
+          category: m.group_item_title || "General",
+          volume: parseFloat(m.volume_24h || m.volume || "0"),
+          currentPrice: yesPrice,
+          outcomes: typeof m.outcomes === 'string' ? JSON.parse(m.outcomes) : m.outcomes,
+          lastUpdated: Date.now(),
+          description: m.description || ""
+        };
+      });
   } catch (error) {
     console.error("Market fetch error:", error);
     return [];

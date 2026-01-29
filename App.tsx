@@ -23,9 +23,9 @@ const INITIAL_STATS: BotStats = {
   cumulativeSpent: 0
 };
 
-const BASE_POLL_INTERVAL = 45000; 
-const ERROR_BACKOFF_INTERVAL = 90000;
-const STEP_DELAY = 1200;
+const BASE_POLL_INTERVAL = 30000; // 30s cycle
+const ERROR_BACKOFF_INTERVAL = 60000;
+const STEP_DELAY = 800;
 
 async function detectProvider(type: WalletType): Promise<any> {
   const win = window as any;
@@ -133,7 +133,7 @@ const App: React.FC = () => {
     
     setIsRunning(true);
     addLog('SUCCESS', `Bot started with hard limit of $${allocated.toFixed(2)} capital.`);
-    addLog('INFO', 'Budget Guard activated. Profits will not increase spending limit.');
+    addLog('INFO', 'Budget Guard activated. Multi-market scan initialized.');
   };
 
   const stopBot = (reason: 'USER' | 'BUDGET' = 'USER') => {
@@ -155,71 +155,87 @@ const App: React.FC = () => {
 
     try {
       // Step 1: Budget Guard Pre-flight
-      const remaining = stats.allocatedCapital - stats.cumulativeSpent;
-      if (remaining <= 0.1) { // Threshold for "fully spent"
+      const remainingBudget = stats.allocatedCapital - stats.cumulativeSpent;
+      if (remainingBudget <= 0.1) { 
         stopBot('BUDGET');
         return;
       }
 
       setCurrentStep('SCANNING');
+      addLog('INFO', 'Fetching top liquid markets from CLOB...');
       const markets = await fetchLiveMarkets();
+      
       if (markets.length === 0) {
+        addLog('WARNING', 'Zero liquidity detected in scan. Retrying in 10s...');
         botTimeoutRef.current = window.setTimeout(runIteration, 10000);
         return;
       }
 
-      setCurrentStep('ANALYZING');
-      const targetMarket = markets[Math.floor(Math.random() * markets.length)];
-      const signal: Signal = await generateMarketSignal(targetMarket);
-      addLog('SIGNAL', `Edge Found: ${(signal.confidence * 100).toFixed(0)}% Confidence`);
+      // Instead of picking 1 random, we evaluate the top 3-5 candidates for edge
+      const candidates = markets.slice(0, 3);
+      let tradeExecuted = false;
 
-      setCurrentStep('RISK_CHECK');
-      const ev = calculateEV(targetMarket.currentPrice, signal.impliedProbability);
-      
-      if (ev > 0 && signal.confidence >= RISK_LIMITS.minConfidence) {
-        let size = calculateKellySize(targetMarket.currentPrice, signal.impliedProbability, stats.balance);
+      for (const targetMarket of candidates) {
+        if (tradeExecuted) break;
         
-        // Enforce Hard Capital Cap
-        if (stats.cumulativeSpent + size > stats.allocatedCapital) {
-          addLog('INFO', 'Adjusting trade size to fit remaining allocation budget.');
-          size = stats.allocatedCapital - stats.cumulativeSpent;
-        }
+        setCurrentStep('ANALYZING');
+        addLog('INFO', `Evaluating Alpha: "${targetMarket.question.slice(0, 40)}..."`);
+        
+        const signal: Signal = await generateMarketSignal(targetMarket);
+        addLog('SIGNAL', `Edge Analysis: ${(signal.confidence * 100).toFixed(0)}% confidence | Implied: ${(signal.impliedProbability * 100).toFixed(1)}%`);
 
-        if (size >= 0.5) { // Minimum trade size
-          setCurrentStep('EXECUTING');
-          addLog('WARNING', `Executing Signed Trade: $${size.toFixed(2)}`, { market: targetMarket.id.slice(0, 8) });
+        setCurrentStep('RISK_CHECK');
+        const ev = calculateEV(targetMarket.currentPrice, signal.impliedProbability);
+        
+        if (ev > 0 && signal.confidence >= RISK_LIMITS.minConfidence) {
+          let size = calculateKellySize(targetMarket.currentPrice, signal.impliedProbability, stats.balance);
           
-          const newTrade: Trade = {
-            id: `tx-${Date.now()}`,
-            marketId: targetMarket.id,
-            marketQuestion: targetMarket.question,
-            entryPrice: targetMarket.currentPrice,
-            size: size,
-            side: 'YES',
-            status: 'OPEN',
-            pnl: 0,
-            timestamp: Date.now(),
-            edge: ev
-          };
+          // Enforce Hard Capital Cap
+          const currentRemaining = stats.allocatedCapital - stats.cumulativeSpent;
+          if (stats.cumulativeSpent + size > stats.allocatedCapital) {
+            size = currentRemaining;
+          }
 
-          setActiveTrades(prev => [newTrade, ...prev].slice(0, 10));
-          setStats(prev => ({
-            ...prev,
-            cumulativeSpent: prev.cumulativeSpent + size,
-            balance: prev.balance - size,
-            totalTrades: prev.totalTrades + 1
-          }));
-          addLog('SUCCESS', `Volume logged. Cumulative spent: $${(stats.cumulativeSpent + size).toFixed(2)}`);
-        } else if (remaining < 0.5) {
-          stopBot('BUDGET');
-          return;
+          if (size >= 0.5) { 
+            setCurrentStep('EXECUTING');
+            addLog('SUCCESS', `Edge Confirmed (EV: ${ev.toFixed(3)}). Sending tx for $${size.toFixed(2)}`);
+            
+            const newTrade: Trade = {
+              id: `tx-${Date.now()}`,
+              marketId: targetMarket.id,
+              marketQuestion: targetMarket.question,
+              entryPrice: targetMarket.currentPrice,
+              size: size,
+              side: 'YES',
+              status: 'OPEN',
+              pnl: 0,
+              timestamp: Date.now(),
+              edge: ev
+            };
+
+            setActiveTrades(prev => [newTrade, ...prev].slice(0, 10));
+            setStats(prev => ({
+              ...prev,
+              cumulativeSpent: prev.cumulativeSpent + size,
+              balance: prev.balance - size,
+              totalTrades: prev.totalTrades + 1
+            }));
+            tradeExecuted = true;
+          }
+        } else {
+          addLog('INFO', 'Alpha insufficient for current candidate. Skipping.');
+          await new Promise(r => setTimeout(r, 500)); // Brief pause between candidates
         }
+      }
+
+      if (!tradeExecuted) {
+        addLog('INFO', 'Scan cycle complete: No actionable edge found in top candidates.');
       }
 
       setCurrentStep('MONITORING');
       botTimeoutRef.current = window.setTimeout(runIteration, nextDelay);
     } catch (error: any) {
-      addLog('ERROR', 'Kernel fault.', error.message);
+      addLog('ERROR', 'Kernel iteration fault.', error.message);
       botTimeoutRef.current = window.setTimeout(runIteration, ERROR_BACKOFF_INTERVAL);
     }
   }, [isRunning, stats, addLog]);
