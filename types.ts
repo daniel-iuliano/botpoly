@@ -4,14 +4,25 @@ export type BotStep = 'IDLE' | 'SCANNING' | 'ANALYZING' | 'RISK_CHECK' | 'EXECUT
 export type WalletType = 'METAMASK' | 'PHANTOM' | 'TRUST' | 'WALLETCONNECT';
 
 export interface Market {
-  id: string;
+  id: string; // conditionId
   question: string;
   category: string;
   volume: number;
-  currentPrice: number; // Probability (0.0 to 1.0)
+  currentPrice: number;
   outcomes: string[];
   lastUpdated: number;
   description: string;
+  // CLOB Specific
+  yesTokenId: string;
+  noTokenId: string;
+  rewards?: boolean;
+}
+
+export interface Orderbook {
+  bids: { price: string; size: string }[];
+  asks: { price: string; size: string }[];
+  spread: number;
+  midPrice: number;
 }
 
 export interface Trade {
@@ -40,8 +51,8 @@ export interface BotStats {
   winRate: number;
   totalTrades: number;
   activeExposure: number;
-  usdcBalance: number; // Trading Capital
-  maticBalance: number; // Gas Fuel
+  usdcBalance: number;
+  maticBalance: number;
   initialUsdcBalance: number;
   allocatedCapital: number;
   cumulativeSpent: number;

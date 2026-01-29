@@ -1,21 +1,24 @@
 
-import { Market, Trade, Signal, BotStats, LogEntry } from "../types";
+import { Market, Orderbook, Signal } from "../types";
 import { RISK_LIMITS } from "../constants";
 
-const POLYMARKET_GAMMA_API = "https://gamma-api.polymarket.com";
+const POLYMARKET_CLOB_API = "https://clob.polymarket.com";
 
 /**
- * Calculates the Expected Value (EV) of a YES position.
+ * Calculates Expected Value (EV)
+ * EV = (P(win) * Net Profit) - (P(loss) * Stake)
  */
 export const calculateEV = (marketPrice: number, estimatedProb: number): number => {
   if (marketPrice <= 0 || marketPrice >= 1) return 0;
-  const profitOnWin = 1 - marketPrice;
-  const lossOnLoss = marketPrice;
-  return (estimatedProb * profitOnWin) - ((1 - estimatedProb) * lossOnLoss);
+  // Net profit is (1 - price) per dollar staked
+  // Loss is the price per dollar staked
+  return (estimatedProb * (1 - marketPrice)) - ((1 - estimatedProb) * marketPrice);
 };
 
 /**
- * Fractional Kelly Criterion for position sizing.
+ * Fractional Kelly sizing based on USDC balance
+ * f* = (bp - q) / b
+ * where b = odds - 1, p = probability of win, q = probability of loss
  */
 export const calculateKellySize = (
   marketPrice: number, 
@@ -23,62 +26,101 @@ export const calculateKellySize = (
   balance: number
 ): number => {
   if (marketPrice <= 0 || marketPrice >= 1) return 0;
-  const b = (1 / marketPrice) - 1;
+  const b = (1 / marketPrice) - 1; // Decimal odds - 1
   const p = estimatedProb;
   const q = 1 - p;
   
-  if (p * b <= q) return 0; // No edge
-
-  const kellyFraction = (p * b - q) / b;
-  const cautiousSize = Math.max(0, kellyFraction * RISK_LIMITS.kellyFraction);
+  const kellyFraction = (b * p - q) / b;
   
-  // Cap by risk limits
-  const maxAllowed = balance * RISK_LIMITS.maxSingleTradeExposure;
-  return Math.min(cautiousSize * balance, maxAllowed);
+  if (kellyFraction <= 0) return 0;
+  
+  // Apply risk limits: fractional Kelly (e.g., 20% of full Kelly) and max single exposure
+  const sizedFraction = Math.min(
+    kellyFraction * RISK_LIMITS.kellyFraction,
+    RISK_LIMITS.maxSingleTradeExposure
+  );
+  
+  return balance * sizedFraction;
 };
 
 /**
- * Fetches real production market data.
- * Switched to Gamma API for better discovery of active, high-liquidity events.
+ * PRODUCTION SCANNER: Fetches live markets directly from CLOB API.
+ * Single source of truth for execution.
  */
 export const fetchLiveMarkets = async (): Promise<Market[]> => {
   try {
-    // Gamma API is more reliable for "what is tradeable now"
-    const response = await fetch(`${POLYMARKET_GAMMA_API}/markets?active=true&closed=false&limit=50&order=volume24hr&dir=desc`);
-    if (!response.ok) throw new Error("Failed to fetch from Polymarket Gamma API");
+    const response = await fetch(`${POLYMARKET_CLOB_API}/markets`);
+    if (!response.ok) throw new Error(`CLOB API Error: ${response.status}`);
     
-    const markets = await response.json();
+    const data = await response.json();
     
-    if (!Array.isArray(markets)) {
-        console.warn("Gamma API returned unexpected format", markets);
-        return [];
-    }
-
-    return markets
-      .filter((m: any) => 
-        m.active === true && 
-        m.closed === false &&
-        m.question &&
-        m.outcomePrices // Ensure we have pricing data
-      )
-      .map((m: any) => {
-        // Gamma API outcomePrices is usually an array of strings ["0.5", "0.5"]
-        const prices = JSON.parse(m.outcomePrices || "[]");
-        const yesPrice = prices[0] ? parseFloat(prices[0]) : 0.5;
-
-        return {
-          id: m.conditionId || m.id,
-          question: m.question,
-          category: m.groupItemTitle || "General",
-          volume: parseFloat(m.volume24hr || "0"),
-          currentPrice: yesPrice,
-          outcomes: m.outcomes ? (typeof m.outcomes === 'string' ? JSON.parse(m.outcomes) : m.outcomes) : ["YES", "NO"],
-          lastUpdated: Date.now(),
-          description: m.description || ""
-        };
-      });
+    // Filter for active, open markets with tradable outcomes
+    return data
+      .filter((m: any) => m.active && !m.closed && m.tokens?.length === 2)
+      .map((m: any) => ({
+        id: m.condition_id,
+        question: m.question,
+        category: m.description?.split(' ')[0] || 'General',
+        volume: 0, // CLOB API doesn't always provide 24h volume in this endpoint
+        currentPrice: 0.5, // Will be updated by orderbook fetch
+        outcomes: m.tokens.map((t: any) => t.outcome),
+        lastUpdated: Date.now(),
+        description: m.description || m.question,
+        yesTokenId: m.tokens.find((t: any) => t.outcome === 'Yes')?.token_id || '',
+        noTokenId: m.tokens.find((t: any) => t.outcome === 'No')?.token_id || '',
+      }))
+      .filter((m: Market) => m.yesTokenId && m.noTokenId);
   } catch (error) {
-    console.error("Market fetch error:", error);
+    console.error("CLOB Market Fetch Failed:", error);
     return [];
   }
+};
+
+/**
+ * Fetches and validates L2 Orderbook depth and spread.
+ */
+export const fetchOrderbook = async (tokenId: string): Promise<Orderbook | null> => {
+  try {
+    const response = await fetch(`${POLYMARKET_CLOB_API}/book?token_id=${tokenId}`);
+    if (!response.ok) return null;
+    
+    const data = await response.json();
+    const bids = data.bids || [];
+    const asks = data.asks || [];
+    
+    if (bids.length === 0 || asks.length === 0) return null;
+    
+    const bestBid = parseFloat(bids[0].price);
+    const bestAsk = parseFloat(asks[0].price);
+    const midPrice = (bestBid + bestAsk) / 2;
+    const spread = (bestAsk - bestBid) / midPrice;
+    
+    return {
+      bids,
+      asks,
+      spread,
+      midPrice
+    };
+  } catch (error) {
+    return null;
+  }
+};
+
+/**
+ * Strict Liquidity Validation
+ */
+export const validateLiquidity = (book: Orderbook, targetSize: number): boolean => {
+  // 1. Spread Check (Max 2% spread for automated entry)
+  if (book.spread > 0.02) return false;
+  
+  // 2. Depth Check (Sufficient liquidity within first 5 price levels)
+  const depthRequired = targetSize * 3; // We want 3x depth for minimal slippage
+  let availableDepth = 0;
+  
+  // Check Ask depth for buying (Yes/No)
+  for (let i = 0; i < Math.min(book.asks.length, 5); i++) {
+    availableDepth += parseFloat(book.asks[i].size) * parseFloat(book.asks[i].price);
+  }
+  
+  return availableDepth >= depthRequired && availableDepth >= 500; // Minimum $500 depth
 };

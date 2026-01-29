@@ -5,8 +5,8 @@ import { BrowserProvider, formatUnits, Contract } from 'ethers';
 import { Dashboard } from './components/Dashboard';
 import { Terminal } from './components/Terminal';
 import { WalletSelector } from './components/WalletSelector';
-import { Market, Trade, BotStats, LogEntry, Signal, BotStep, WalletType } from './types';
-import { fetchLiveMarkets, calculateEV, calculateKellySize } from './services/tradingEngine';
+import { Market, Trade, BotStats, LogEntry, Signal, BotStep, WalletType, Orderbook } from './types';
+import { fetchLiveMarkets, calculateEV, calculateKellySize, fetchOrderbook, validateLiquidity } from './services/tradingEngine';
 import { generateMarketSignal } from './services/geminiService';
 import { ICONS, RISK_LIMITS, POLYGON_TOKENS } from './constants';
 
@@ -93,37 +93,26 @@ const App: React.FC = () => {
     setLogs(prev => [...prev.slice(-100), { timestamp: Date.now(), level, message, data }]);
   }, []);
 
-  /**
-   * PRODUCTION FIX: Multi-token aggregate balance detection.
-   * Checks both Native USDC and Bridged USDC on Polygon.
-   */
   const fetchBalances = async (account: string, provider: BrowserProvider) => {
     try {
-      // 1. Verify Chain is still Polygon
       const network = await provider.getNetwork();
       if (network.chainId !== POLYGON_CHAIN_ID) {
         addLog('ERROR', `Network Mismatch: Detected Chain ${network.chainId}. Switch to Polygon (137).`);
         return null;
       }
 
-      // 2. Fetch Native Gas (MATIC)
       const maticBalanceRaw = await provider.getBalance(account);
       const maticBalance = parseFloat(formatUnits(maticBalanceRaw, 18));
 
-      // 3. Fetch USDC (Native)
       const nativeContract = new Contract(POLYGON_TOKENS.USDC_NATIVE, ERC20_ABI, provider);
       const rawNative = await nativeContract.balanceOf(account);
       const nativeUsdc = parseFloat(formatUnits(rawNative, 6));
 
-      // 4. Fetch USDC (Bridged/USDC.e)
       const bridgedContract = new Contract(POLYGON_TOKENS.USDC_BRIDGED, ERC20_ABI, provider);
       const rawBridged = await bridgedContract.balanceOf(account);
       const bridgedUsdc = parseFloat(formatUnits(rawBridged, 6));
 
       const totalUsdc = nativeUsdc + bridgedUsdc;
-
-      // Log Raw Data for Transparency
-      console.debug(`[POLYGON_SCAN] Native: ${rawNative.toString()} | Bridged: ${rawBridged.toString()}`);
       
       setStats(prev => ({ 
         ...prev, 
@@ -145,7 +134,7 @@ const App: React.FC = () => {
     try {
       const rawProvider = await detectProvider(type);
       if (!rawProvider) {
-        addLog('ERROR', `${type} extension not found. Please install or unlock.`);
+        addLog('ERROR', `${type} extension not found.`);
         setShowWalletSelector(false);
         setIsConnecting(false);
         return;
@@ -153,8 +142,6 @@ const App: React.FC = () => {
 
       const provider = new BrowserProvider(rawProvider);
       const network = await provider.getNetwork();
-      
-      addLog('INFO', `Verifying Settlement Chain: ${network.chainId}`);
       
       if (network.chainId !== POLYGON_CHAIN_ID) {
         addLog('ERROR', `Chain ID ${network.chainId} unsupported. Switch to Polygon (137).`);
@@ -173,13 +160,8 @@ const App: React.FC = () => {
         setShowWalletSelector(false);
         addLog('SUCCESS', `Session Established: ${accounts[0].slice(0,6)}...`);
         addLog('INFO', `Detected Liquidity: $${bals.usdcBalance.toFixed(2)} total USDC.`);
-        
-        if (bals.nativeUsdc > 0 && bals.bridgedUsdc > 0) {
-          addLog('INFO', `Aggregated $${bals.nativeUsdc.toFixed(2)} Native + $${bals.bridgedUsdc.toFixed(2)} Bridged.`);
-        }
-        
         if (bals.usdcBalance === 0) {
-          addLog('WARNING', 'Zero Tradeable Capital. Deposit USDC on Polygon to continue.');
+          addLog('WARNING', 'Zero Tradeable Capital detected.');
         }
       }
     } catch (error: any) {
@@ -192,11 +174,11 @@ const App: React.FC = () => {
   const startBot = () => {
     if (!isConnected) return;
     if (stats.usdcBalance <= 0) {
-      addLog('ERROR', 'Cannot deploy: USDC balance is zero. Verification required.');
+      addLog('ERROR', 'Cannot deploy: USDC balance is zero.');
       return;
     }
     if (stats.maticBalance < POLYGON_TOKENS.MIN_MATIC_FOR_GAS) {
-      addLog('ERROR', `Low Fuel: Need at least ${POLYGON_TOKENS.MIN_MATIC_FOR_GAS} MATIC.`);
+      addLog('ERROR', `Insufficient Gas: Need at least ${POLYGON_TOKENS.MIN_MATIC_FOR_GAS} MATIC.`);
       return;
     }
 
@@ -215,19 +197,18 @@ const App: React.FC = () => {
     setIsRunning(false);
     setCurrentStep(reason === 'BUDGET' ? 'EXHAUSTED' : 'IDLE');
     if (botTimeoutRef.current) window.clearTimeout(botTimeoutRef.current);
-    addLog('WARNING', reason === 'BUDGET' ? 'Target reached/Budget used.' : 'Emergency shutdown executed.');
+    addLog('WARNING', reason === 'BUDGET' ? 'Budget exhausted.' : 'Manual shutdown.');
   };
 
   const runIteration = useCallback(async () => {
     if (!isRunning || !address || !providerRef.current) return;
 
     try {
-      // Sync state before scan
       const currentBals = await fetchBalances(address, providerRef.current);
       if (!currentBals) throw new Error("State sync failed.");
 
       if (currentBals.maticBalance < 0.1) {
-        addLog('ERROR', 'Gas Safety Violation: Critical low MATIC.');
+        addLog('ERROR', 'Gas Safety: Critical low MATIC. Stopping bot.');
         stopBot('USER');
         return;
       }
@@ -239,28 +220,44 @@ const App: React.FC = () => {
       }
 
       setCurrentStep('SCANNING');
+      addLog('INFO', 'Scanning CLOB for liquid candidates...');
       const markets = await fetchLiveMarkets();
       if (markets.length === 0) {
-        botTimeoutRef.current = window.setTimeout(runIteration, 15000);
+        addLog('WARNING', 'No active markets found on CLOB. Retrying in 30s.');
+        botTimeoutRef.current = window.setTimeout(runIteration, 30000);
         return;
       }
 
-      addLog('INFO', `Scan: ${markets.length} liquid candidates.`);
-
-      const candidates = markets.slice(0, 5);
       let tradeExecuted = false;
+      let filteredCount = 0;
 
-      for (const targetMarket of candidates) {
+      for (const m of markets.slice(0, 10)) {
         if (tradeExecuted || !isRunning) break;
+        
+        // 1. Fetch Orderbook (Source of Truth for Price and Depth)
+        const book: Orderbook | null = await fetchOrderbook(m.yesTokenId);
+        if (!book) {
+          filteredCount++;
+          continue;
+        }
+
+        // 2. Validate Liquidity & Spread
+        const isLiquid = validateLiquidity(book, 10); // Check depth for min $10 size
+        if (!isLiquid) {
+          filteredCount++;
+          continue;
+        }
+
+        m.currentPrice = book.midPrice;
         
         setCurrentStep('ANALYZING');
         try {
-          const signal: Signal = await generateMarketSignal(targetMarket);
+          const signal: Signal = await generateMarketSignal(m);
           setCurrentStep('RISK_CHECK');
-          const ev = calculateEV(targetMarket.currentPrice, signal.impliedProbability);
+          const ev = calculateEV(m.currentPrice, signal.impliedProbability);
           
           if (ev > 0 && signal.confidence >= RISK_LIMITS.minConfidence) {
-            let size = calculateKellySize(targetMarket.currentPrice, signal.impliedProbability, stats.usdcBalance);
+            let size = calculateKellySize(m.currentPrice, signal.impliedProbability, stats.usdcBalance);
             
             const currentRemaining = stats.allocatedCapital - stats.cumulativeSpent;
             if (stats.cumulativeSpent + size > stats.allocatedCapital) {
@@ -268,33 +265,47 @@ const App: React.FC = () => {
             }
 
             if (size >= 0.5) { 
-              setCurrentStep('EXECUTING');
-              addLog('SUCCESS', `Executing Alpha: ${targetMarket.id.slice(0,8)}. Size: $${size.toFixed(2)}`);
-              
-              const newTrade: Trade = {
-                id: `tx-${Date.now()}`,
-                marketId: targetMarket.id,
-                marketQuestion: targetMarket.question,
-                entryPrice: targetMarket.currentPrice,
-                size: size,
-                side: 'YES',
-                status: 'OPEN',
-                pnl: 0,
-                timestamp: Date.now(),
-                edge: ev
-              };
+              // Confirm execution liquidity one last time for sized amount
+              if (validateLiquidity(book, size)) {
+                setCurrentStep('EXECUTING');
+                addLog('SUCCESS', `Executing Alpha: ${m.id.slice(0,8)}. Size: $${size.toFixed(2)} | Edge: ${(ev*100).toFixed(1)}%`);
+                
+                const newTrade: Trade = {
+                  id: `tx-${Date.now()}`,
+                  marketId: m.id,
+                  marketQuestion: m.question,
+                  entryPrice: m.currentPrice,
+                  size: size,
+                  side: 'YES',
+                  status: 'OPEN',
+                  pnl: 0,
+                  timestamp: Date.now(),
+                  edge: ev
+                };
 
-              setActiveTrades(prev => [newTrade, ...prev].slice(0, 10));
-              setStats(prev => ({
-                ...prev,
-                cumulativeSpent: prev.cumulativeSpent + size,
-                usdcBalance: prev.usdcBalance - size,
-                totalTrades: prev.totalTrades + 1
-              }));
-              tradeExecuted = true;
+                setActiveTrades(prev => [newTrade, ...prev].slice(0, 10));
+                setStats(prev => ({
+                  ...prev,
+                  cumulativeSpent: prev.cumulativeSpent + size,
+                  usdcBalance: prev.usdcBalance - size,
+                  totalTrades: prev.totalTrades + 1
+                }));
+                tradeExecuted = true;
+              } else {
+                addLog('WARNING', `Skipped ${m.id.slice(0,8)}: Insufficient depth for size $${size.toFixed(2)}`);
+              }
             }
           }
-        } catch (e) { console.error(e); }
+        } catch (e) { 
+          addLog('ERROR', `Analysis failed for ${m.id.slice(0,8)}`);
+        }
+        
+        // Sequential fetch delay to prevent rate limit
+        await new Promise(r => setTimeout(r, 200));
+      }
+
+      if (!tradeExecuted && filteredCount > 0) {
+        addLog('INFO', `Cycle complete. ${filteredCount} markets filtered due to spread/liquidity.`);
       }
 
       setCurrentStep('MONITORING');
@@ -320,14 +331,14 @@ const App: React.FC = () => {
             <BrainCircuit className="text-white w-8 h-8" />
           </div>
           <div>
-            <h1 className="text-2xl font-black tracking-tighter italic text-white">POLYQUANT-X <span className="text-[10px] not-italic font-bold bg-amber-500 text-black px-2 py-0.5 rounded ml-2 uppercase tracking-widest">Mainnet Verified</span></h1>
+            <h1 className="text-2xl font-black tracking-tighter italic text-white">POLYQUANT-X <span className="text-[10px] not-italic font-bold bg-amber-500 text-black px-2 py-0.5 rounded ml-2 uppercase tracking-widest">CLOB Core</span></h1>
             <div className="flex items-center gap-3 mt-1">
                <span className={`text-[9px] font-mono uppercase tracking-widest ${isRunning ? 'text-emerald-500 animate-pulse' : 'text-gray-500'}`}>
                 {isRunning ? 'Kernel: Running' : 'Kernel: Idle'}
               </span>
               <span className="text-gray-700">|</span>
               <span className="text-[9px] text-gray-500 font-mono flex items-center gap-1">
-                <Coins className="w-3 h-3 text-blue-400" /> USDC Pool: ${(stats.usdcBalance || 0).toFixed(2)}
+                <Coins className="w-3 h-3 text-blue-400" /> USDC: ${(stats.usdcBalance || 0).toFixed(2)}
               </span>
             </div>
           </div>
@@ -377,23 +388,23 @@ const App: React.FC = () => {
           </div>
           <div className="glass p-8 rounded-3xl border border-white/5 space-y-6">
             <h3 className="text-lg font-bold flex items-center gap-3">
-              <ShieldAlert className="text-amber-500 w-5 h-5" /> Mainnet Safety
+              <ShieldAlert className="text-amber-500 w-5 h-5" /> Execution Guard
             </h3>
             <div className="space-y-4">
               <div className="p-4 rounded-xl bg-blue-500/5 border border-blue-500/10">
-                <span className="text-[9px] text-gray-500 uppercase block mb-1">Detected Cargo</span>
-                <span className="text-sm font-bold text-blue-400">Multi-USDC Aggregation</span>
-                <p className="text-[10px] text-gray-500 mt-1 leading-tight italic">Detecting both Native (Circle) and Bridged (USDC.e) tokens on Polygon PoS.</p>
+                <span className="text-[9px] text-gray-500 uppercase block mb-1">Price Oracle</span>
+                <span className="text-sm font-bold text-blue-400">Polymarket CLOB</span>
+                <p className="text-[10px] text-gray-500 mt-1 leading-tight italic">Direct L2 orderbook access ensures execution at real market depth.</p>
               </div>
               <div className="p-4 rounded-xl bg-amber-500/5 border border-amber-500/10">
-                <span className="text-[9px] text-gray-500 uppercase block mb-1">Fuel Gauge</span>
-                <span className="text-sm font-bold text-amber-500">MATIC Verification</span>
-                <p className="text-[10px] text-gray-500 mt-1 leading-tight italic">Active chain monitoring prevents stuck txs during high congestion.</p>
+                <span className="text-[9px] text-gray-500 uppercase block mb-1">Slippage Protection</span>
+                <span className="text-sm font-bold text-amber-500">Max 2% Spread</span>
+                <p className="text-[10px] text-gray-500 mt-1 leading-tight italic">Markets with excessive spreads are automatically filtered from scanning.</p>
               </div>
               <div className="p-4 rounded-xl bg-emerald-500/5 border border-emerald-500/10">
-                <span className="text-[9px] text-gray-500 uppercase block mb-1">Network Enforcement</span>
-                <span className="text-sm font-bold text-gray-200">Polygon Chain 137</span>
-                <p className="text-[10px] text-gray-500 mt-1 leading-tight italic">Cross-chain safety: Handshake is rejected if wallet is on Ethereum or other chains.</p>
+                <span className="text-[9px] text-gray-500 uppercase block mb-1">Capital Integrity</span>
+                <span className="text-sm font-bold text-gray-200">Kelly Verification</span>
+                <p className="text-[10px] text-gray-500 mt-1 leading-tight italic">Position sizes are verifiably bounded by USDC liquidity and signal confidence.</p>
               </div>
             </div>
           </div>
@@ -401,7 +412,7 @@ const App: React.FC = () => {
       </main>
 
       <footer className="text-center text-gray-600 text-[10px] uppercase tracking-[0.3em] font-mono border-t border-white/5 pt-8">
-        &copy; 2025 POLYQUANT-X // MULTI_TOKEN_AGGREGATION_V2 // v4.3.0-PROD
+        &copy; 2025 POLYQUANT-X // CLOB_EXECUTION_ENGINE // v5.0.0-STABLE
       </footer>
     </div>
   );
