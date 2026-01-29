@@ -16,6 +16,8 @@ export interface Market {
   yesTokenId: string;
   noTokenId: string;
   rewards?: boolean;
+  acceptingOrders: boolean;
+  enableOrderBook: boolean;
 }
 
 export interface Orderbook {

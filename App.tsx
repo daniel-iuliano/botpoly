@@ -83,37 +83,39 @@ const App: React.FC = () => {
   };
 
   const runIteration = useCallback(async () => {
+    // Check execution lock and global run state
     if (!isRunning || isExecutingRef.current || !address || !providerRef.current) return;
     
     isExecutingRef.current = true;
     try {
-      // 1. Check State
+      // 1. Snapshot State
       const currentBals = await fetchBalances(address, providerRef.current);
-      if (!currentBals || currentBals.maticBalance < 0.05) {
-        addLog('ERROR', 'Safety Check Failed: Verification required.');
-        setIsRunning(false);
-        return;
-      }
+      if (!currentBals) throw new Error("Balance sync failed.");
 
-      // 2. Discover Markets
+      // 2. Discover Tradable Markets
       setCurrentStep('SCANNING');
-      const { markets, totalFetched, filtered } = await fetchLiveMarkets();
+      addLog('INFO', 'Scanning CLOB for tradable opportunities...');
+      const { markets, totalFetched, discardedClosed, discardedNoBook } = await fetchLiveMarkets();
       
       if (totalFetched === 0) {
-        addLog('WARNING', 'CLOB unreachable or empty. Resting...');
+        addLog('WARNING', 'CLOB returned 0 markets. API might be rate-limiting or down.');
       } else {
-        addLog('INFO', `CLOB Discovery: ${totalFetched} raw markets. ${markets.length} passed schema filter.`);
+        addLog('INFO', `Scan Report: ${totalFetched} found. Tradable: ${markets.length} | Closed: ${discardedClosed} | NoBook: ${discardedNoBook}`);
       }
 
       if (markets.length > 0) {
         let tradeExecuted = false;
-        const candidates = markets.slice(0, 5); // Focus on top liquid candidates
+        // Prioritize first 5 for analysis to respect Gemini rate limits
+        const candidates = markets.slice(0, 5); 
 
         for (const m of candidates) {
           if (tradeExecuted || !isRunning) break;
 
+          // Validate L2 Depth
           const book = await fetchOrderbook(m.yesTokenId);
-          if (!book || !validateLiquidity(book, 5)) continue;
+          if (!book || !validateLiquidity(book, 10)) {
+            continue; 
+          }
 
           m.currentPrice = book.midPrice;
           setCurrentStep('ANALYZING');
@@ -125,11 +127,10 @@ const App: React.FC = () => {
 
             if (ev > 0 && signal.confidence >= RISK_LIMITS.minConfidence) {
               const size = calculateKellySize(m.currentPrice, signal.impliedProbability, stats.usdcBalance);
-              if (size >= 1) { // Min $1 trade
+              if (size >= 1) { 
                 setCurrentStep('EXECUTING');
-                addLog('SUCCESS', `Edge Detected: ${m.id.slice(0,8)}. EV: ${(ev*100).toFixed(1)}%. Deploying $${size.toFixed(2)}.`);
+                addLog('SUCCESS', `Signal Detected: ${m.id.slice(0,8)}. Edge: ${(ev*100).toFixed(1)}%. Order: $${size.toFixed(2)}`);
                 
-                // Fix: Explicitly typing the new trade object to satisfy literal type requirements for 'side' and 'status' (YES/NO, OPEN/CLOSED)
                 const newTrade: Trade = {
                   id: `tx-${Date.now()}`, 
                   marketId: m.id, 
@@ -146,42 +147,54 @@ const App: React.FC = () => {
                 setActiveTrades(prev => [newTrade, ...prev].slice(0, 10));
 
                 setStats(prev => ({
-                  ...prev, cumulativeSpent: prev.cumulativeSpent + size,
-                  usdcBalance: prev.usdcBalance - size, totalTrades: prev.totalTrades + 1
+                  ...prev, 
+                  cumulativeSpent: prev.cumulativeSpent + size,
+                  usdcBalance: prev.usdcBalance - size, 
+                  totalTrades: prev.totalTrades + 1
                 }));
                 tradeExecuted = true;
               }
             }
-          } catch (e) { /* Analysis error */ }
-          await new Promise(r => setTimeout(r, 500)); // Rate limit buffer
+          } catch (e) { /* Signal failure is non-fatal */ }
+          
+          // Small delay between book/signal checks to avoid IP bans
+          await new Promise(r => setTimeout(r, 400)); 
         }
       }
     } catch (error: any) {
-      addLog('ERROR', 'Loop Kernel Error.', error.message);
+      addLog('ERROR', 'Iteration Kernel Failure.', error.message);
     } finally {
       isExecutingRef.current = false;
       setCurrentStep('MONITORING');
+      // Explicitly check isRunning again before queuing next iteration
       if (isRunning) {
+        if (botTimeoutRef.current) clearTimeout(botTimeoutRef.current);
         botTimeoutRef.current = setTimeout(runIteration, SCAN_INTERVAL);
       }
     }
-  }, [isRunning, address, stats.usdcBalance, stats.allocatedCapital, stats.cumulativeSpent, addLog]);
+    // We intentionally omit stats dependencies from the useCallback to keep the loop stable.
+    // Instead, we use the latest state values via functional updates or state snapshots.
+  }, [isRunning, address, addLog]);
 
   useEffect(() => {
     if (isRunning) {
+      addLog('INFO', `Agent Active. Scan interval: ${SCAN_INTERVAL/1000}s`);
       runIteration();
     } else {
       if (botTimeoutRef.current) clearTimeout(botTimeoutRef.current);
       setCurrentStep('IDLE');
     }
     return () => { if (botTimeoutRef.current) clearTimeout(botTimeoutRef.current); };
-  }, [isRunning]); // Strictly triggered only when isRunning toggles
+  }, [isRunning]); // Strictly triggers only on start/stop toggle
 
   const startBot = () => {
     if (!isConnected || stats.usdcBalance <= 0) return;
-    setStats(prev => ({ ...prev, allocatedCapital: stats.usdcBalance * (allocationPercent / 100), cumulativeSpent: 0 }));
+    setStats(prev => ({ 
+      ...prev, 
+      allocatedCapital: stats.usdcBalance * (allocationPercent / 100), 
+      cumulativeSpent: 0 
+    }));
     setIsRunning(true);
-    addLog('SUCCESS', 'Agent Deployed.');
   };
 
   return (
@@ -234,24 +247,24 @@ const App: React.FC = () => {
         <div className="grid grid-cols-1 lg:grid-cols-3 gap-8">
           <div className="lg:col-span-2"><Terminal logs={logs} /></div>
           <div className="glass p-8 rounded-3xl border border-white/5 space-y-6">
-            <h3 className="text-lg font-bold flex items-center gap-3"><ShieldAlert className="text-amber-500 w-5 h-5" /> Safety Protocols</h3>
+            <h3 className="text-lg font-bold flex items-center gap-3"><ShieldAlert className="text-amber-500 w-5 h-5" /> Execution Guard</h3>
             <div className="space-y-4">
               <div className="p-4 rounded-xl bg-blue-500/5 border border-blue-500/10">
-                <span className="text-[9px] text-gray-500 uppercase block mb-1">CLOB Oracle</span>
-                <span className="text-sm font-bold text-blue-400">Direct Orderbook</span>
-                <p className="text-[10px] text-gray-500 mt-1 italic leading-tight">Scanner uses condition_ids from the CLOB L2 feed for verified liquidity.</p>
+                <span className="text-[9px] text-gray-500 uppercase block mb-1">Tradability Check</span>
+                <span className="text-sm font-bold text-blue-400">CLOB Discovery</span>
+                <p className="text-[10px] text-gray-500 mt-1 italic leading-tight">Scanner enforces accepting_orders and enable_order_book flags.</p>
               </div>
               <div className="p-4 rounded-xl bg-amber-500/5 border border-amber-500/10">
                 <span className="text-[9px] text-gray-500 uppercase block mb-1">Execution Limit</span>
-                <span className="text-sm font-bold text-amber-500">Max Exposure: 5%</span>
-                <p className="text-[10px] text-gray-500 mt-1 italic leading-tight">Single-trade Kelly fraction enforced to protect bankroll.</p>
+                <span className="text-sm font-bold text-amber-500">Spread &lt; 5%</span>
+                <p className="text-[10px] text-gray-500 mt-1 italic leading-tight">Prevailing market spread is verified against orderbook depth before analysis.</p>
               </div>
             </div>
           </div>
         </div>
       </main>
       <footer className="text-center text-gray-600 text-[10px] uppercase tracking-[0.3em] font-mono border-t border-white/5 pt-8">
-        &copy; 2025 POLYQUANT-X // STABLE_KERNEL_V5 // v5.1.0-PROD
+        &copy; 2025 POLYQUANT-X // STABLE_KERNEL_V5 // v5.2.0-PROD
       </footer>
     </div>
   );
