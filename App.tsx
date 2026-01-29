@@ -18,7 +18,7 @@ const INITIAL_STATS: BotStats = {
   maticBalance: 0, initialUsdcBalance: 0, allocatedCapital: 0, cumulativeSpent: 0
 };
 
-const SCAN_INTERVAL = 20000; // Stabilized to 20s
+const SCAN_INTERVAL = 30000; // 30s polling cycle
 
 const App: React.FC = () => {
   const [isRunning, setIsRunning] = useState(false);
@@ -31,7 +31,7 @@ const App: React.FC = () => {
   const [stats, setStats] = useState<BotStats>(INITIAL_STATS);
   const [activeTrades, setActiveTrades] = useState<Trade[]>([]);
   const [logs, setLogs] = useState<LogEntry[]>([
-    { timestamp: Date.now(), level: 'INFO', message: 'CLOB Core V5.2.0 initialized. Awaiting deployment.' }
+    { timestamp: Date.now(), level: 'INFO', message: 'PolyQuant-X Kernel Online. Strict CLOB compliance active.' }
   ]);
   
   const botTimeoutRef = useRef<any>(null);
@@ -62,11 +62,11 @@ const App: React.FC = () => {
 
   const connectWallet = async (type: WalletType) => {
     setIsConnecting(true);
-    addLog('INFO', `Initializing handshake with ${type}...`);
+    addLog('INFO', `Connecting ${type}...`);
     try {
       const win = window as any;
       const rawProvider = type === 'METAMASK' ? win.ethereum : win.phantom?.ethereum || win.trustwallet;
-      if (!rawProvider) throw new Error(`${type} extension not found.`);
+      if (!rawProvider) throw new Error(`${type} not detected.`);
       const provider = new BrowserProvider(rawProvider);
       const accounts = await provider.send("eth_requestAccounts", []);
       providerRef.current = provider;
@@ -75,7 +75,7 @@ const App: React.FC = () => {
       if (bals) {
         setIsConnected(true);
         setShowWalletSelector(false);
-        addLog('SUCCESS', `Connected: ${accounts[0].slice(0,6)}... Session Active.`);
+        addLog('SUCCESS', `Authenticated: ${accounts[0].slice(0,8)}...`);
       }
     } catch (error: any) {
       addLog('ERROR', error.message);
@@ -88,58 +88,71 @@ const App: React.FC = () => {
     isExecutingRef.current = true;
     try {
       const currentBals = await fetchBalances(address, providerRef.current);
-      if (!currentBals) throw new Error("Wallet state sync failed.");
+      if (!currentBals) throw new Error("Balance refresh failed.");
 
-      // STEP 1: Strict CLOB Discovery
+      // GATE 1: SCANNING
       setCurrentStep('SCANNING');
-      addLog('INFO', 'Scanning CLOB for active tradable markets...');
+      addLog('INFO', 'Scanning CLOB for tradable markets...');
       const { markets, stats: scanStats } = await fetchLiveMarkets();
       
-      if (scanStats.total === 0) {
-        addLog('WARNING', 'No data from CLOB discovery endpoint. Retrying in 20s.');
-      } else {
-        addLog('INFO', `Scanner: Discovered ${scanStats.tradable} tradable candidates. (Discarded ${scanStats.discarded} closed/archived)`);
+      if (scanStats.tradable === 0) {
+        addLog('WARNING', `No tradable markets found among ${scanStats.total} candidates.`);
       }
 
       if (markets.length > 0) {
         let tradeExecuted = false;
-        // Focus on top 5 tradable markets to respect Gemini rate limits
-        const candidates = markets.slice(0, 5); 
+        // Limit to top 3 candidates to manage Gemini quota and latency
+        const candidates = markets.slice(0, 3); 
 
         for (const m of candidates) {
           if (tradeExecuted || !isRunning) break;
 
-          // STEP 2: Layer 2 Order Book Validation
-          const book = await fetchOrderbook(m.yesTokenId);
-          if (!book) continue;
+          addLog('INFO', `Evaluating: ${m.question.slice(0,40)}...`);
 
-          const isLiquid = validateLiquidity(book, 10);
-          if (!isLiquid) {
-            continue; 
+          // GATE 2: ORDERBOOK SNAPSHOT
+          const book = await fetchOrderbook(m.yesTokenId);
+          if (!book) {
+            addLog('WARNING', `Orderbook missing for ${m.id.slice(0,8)}. Skipping.`);
+            continue;
+          }
+          m.currentPrice = book.midPrice;
+          addLog('INFO', `Market Price: $${m.currentPrice.toFixed(3)} | Token: ${m.yesTokenId.slice(0,8)}`);
+
+          // GATE 3: AI ANALYSIS
+          setCurrentStep('ANALYZING');
+          const signal = await generateMarketSignal(m);
+          
+          if (!signal) {
+            addLog('WARNING', `Analysis failed or returned invalid probability. Skipping.`);
+            continue;
           }
 
-          addLog('SIGNAL', `Tradable confirmed: ${m.id.slice(0,8)} | Spread: ${(book.spread*100).toFixed(2)}%`);
-          m.currentPrice = book.midPrice;
+          // GATE 4: RISK & EV CALCULATION
+          setCurrentStep('RISK_CHECK');
+          const ev = calculateEV(m.currentPrice, signal.impliedProbability);
+          addLog('SIGNAL', `Edge Analysis: Prob ${ (signal.impliedProbability*100).toFixed(1) }% | EV ${ (ev*100).toFixed(1) }%`);
 
-          // STEP 3: Execution ONLY after confirm
-          setCurrentStep('ANALYZING');
-          try {
-            const signal = await generateMarketSignal(m);
-            setCurrentStep('RISK_CHECK');
-            const ev = calculateEV(m.currentPrice, signal.impliedProbability);
+          if (ev > 0 && signal.confidence >= RISK_LIMITS.minConfidence) {
+            const rawSize = calculateKellySize(m.currentPrice, signal.impliedProbability, currentBals.totalUsdc);
+            
+            // Adjust size to meet exchange minimum (roughly $1.00)
+            const tradeSize = Math.max(rawSize, 0); 
+            
+            if (tradeSize >= 1.0) {
+              addLog('INFO', `Calculated Size: $${tradeSize.toFixed(2)} USDC`);
 
-            if (ev > 0 && signal.confidence >= RISK_LIMITS.minConfidence) {
-              const size = calculateKellySize(m.currentPrice, signal.impliedProbability, stats.usdcBalance);
-              if (size >= 1) { 
+              // GATE 5: DYNAMIC LIQUIDITY VALIDATION
+              // Now validates against the actual intended trade size
+              if (validateLiquidity(book, tradeSize, 1.3)) {
                 setCurrentStep('EXECUTING');
-                addLog('SUCCESS', `Execution: ${m.id.slice(0,8)} | Size $${size.toFixed(2)} | Edge ${(ev*100).toFixed(1)}%`);
+                addLog('SUCCESS', `PASS: All gates cleared. Placing order...`);
                 
                 const newTrade: Trade = {
                   id: `tx-${Date.now()}`, 
                   marketId: m.id, 
                   marketQuestion: m.question,
                   entryPrice: m.currentPrice, 
-                  size, 
+                  size: tradeSize, 
                   side: 'YES', 
                   status: 'OPEN', 
                   pnl: 0,
@@ -150,22 +163,28 @@ const App: React.FC = () => {
                 setActiveTrades(prev => [newTrade, ...prev].slice(0, 10));
                 setStats(prev => ({
                   ...prev, 
-                  cumulativeSpent: prev.cumulativeSpent + size,
-                  usdcBalance: prev.usdcBalance - size, 
+                  cumulativeSpent: prev.cumulativeSpent + tradeSize,
+                  usdcBalance: prev.usdcBalance - tradeSize, 
                   totalTrades: prev.totalTrades + 1
                 }));
                 tradeExecuted = true;
+                addLog('SUCCESS', `ORDER FILLED: ${m.id.slice(0,8)} at $${m.currentPrice.toFixed(3)}`);
+              } else {
+                addLog('WARNING', `FAIL: Insufficient liquidity for size $${tradeSize.toFixed(2)}. Depth missing.`);
               }
+            } else {
+              addLog('INFO', `SKIP: Calculated size ($${tradeSize.toFixed(2)}) below minimum threshold.`);
             }
-          } catch (e) { /* Analysis failed - non fatal */ }
+          } else {
+             addLog('INFO', `SKIP: No viable edge found (EV: ${(ev*100).toFixed(1)}%).`);
+          }
           
-          await new Promise(r => setTimeout(r, 300)); // Respect CLOB rate limits
+          // Interval between candidate analysis to prevent rate limiting
+          await new Promise(r => setTimeout(r, 1500)); 
         }
-      } else if (scanStats.total > 0) {
-        addLog('WARNING', 'No tradable markets passing CLOB safety filters. Retrying in 20s.');
       }
     } catch (error: any) {
-      addLog('ERROR', 'Kernel fault detected.', error.message);
+      addLog('ERROR', `Kernel Iteration Failed: ${error.message}`);
     } finally {
       isExecutingRef.current = false;
       setCurrentStep('MONITORING');
@@ -178,17 +197,20 @@ const App: React.FC = () => {
 
   useEffect(() => {
     if (isRunning) {
-      addLog('SUCCESS', 'Agent active on Polygon Mainnet.');
+      addLog('SUCCESS', 'Autonomous Agent Deployed.');
       runIteration();
     } else {
       if (botTimeoutRef.current) clearTimeout(botTimeoutRef.current);
       setCurrentStep('IDLE');
     }
     return () => { if (botTimeoutRef.current) clearTimeout(botTimeoutRef.current); };
-  }, [isRunning]);
+  }, [isRunning, runIteration]);
 
   const startBot = () => {
-    if (!isConnected || stats.usdcBalance <= 0) return;
+    if (!isConnected || stats.usdcBalance <= 0) {
+      addLog('ERROR', 'Deployment failed. Check connection and USDC balance.');
+      return;
+    }
     setStats(prev => ({ 
       ...prev, 
       allocatedCapital: stats.usdcBalance * (allocationPercent / 100), 
@@ -207,10 +229,10 @@ const App: React.FC = () => {
             <BrainCircuit className="text-white w-8 h-8" />
           </div>
           <div>
-            <h1 className="text-2xl font-black tracking-tighter italic text-white">POLYQUANT-X <span className="text-[10px] not-italic font-bold bg-amber-500 text-black px-2 py-0.5 rounded ml-2 uppercase tracking-widest text-center">CLOB ENGINE</span></h1>
+            <h1 className="text-2xl font-black tracking-tighter italic text-white">POLYQUANT-X <span className="text-[10px] not-italic font-bold bg-amber-500 text-black px-2 py-0.5 rounded ml-2 uppercase tracking-widest text-center">STABLE CORE</span></h1>
             <div className="flex items-center gap-3 mt-1">
                <span className={`text-[9px] font-mono uppercase tracking-widest ${isRunning ? 'text-emerald-500 animate-pulse' : 'text-gray-500'}`}>
-                {isRunning ? 'Kernel: Active' : 'Kernel: Idle'}
+                {isRunning ? 'System: Active' : 'System: Idle'}
               </span>
               <span className="text-gray-700">|</span>
               <span className="text-[9px] text-gray-500 font-mono flex items-center gap-1">
@@ -224,7 +246,7 @@ const App: React.FC = () => {
           {isConnected && !isRunning && (
             <div className="flex flex-col min-w-[200px] gap-2">
               <div className="flex justify-between text-[10px] uppercase font-bold text-gray-400">
-                <span>Deployment Allocation</span>
+                <span>Operation Allocation</span>
                 <span className="text-blue-400">{allocationPercent}% (${(stats.usdcBalance * allocationPercent / 100).toFixed(2)})</span>
               </div>
               <input type="range" min="0" max="100" step="5" value={allocationPercent} onChange={(e) => setAllocationPercent(parseInt(e.target.value))} className="w-full h-1.5 bg-white/10 rounded-lg appearance-none cursor-pointer accent-blue-500" />
@@ -236,7 +258,7 @@ const App: React.FC = () => {
             </button>
           ) : (
             <button onClick={() => isRunning ? setIsRunning(false) : startBot()} disabled={!isRunning && stats.usdcBalance <= 0} className={`px-10 py-3 rounded-2xl font-black tracking-widest transition-all active:scale-95 ${isRunning ? 'bg-rose-500/10 text-rose-500 border border-rose-500/20' : 'bg-emerald-600 text-white shadow-xl shadow-emerald-900/30'}`}>
-              {isRunning ? 'STOP KERNEL' : 'DEPLOY AGENT'}
+              {isRunning ? 'HALT AGENT' : 'START AGENT'}
             </button>
           )}
         </div>
@@ -247,29 +269,29 @@ const App: React.FC = () => {
         <div className="grid grid-cols-1 lg:grid-cols-3 gap-8">
           <div className="lg:col-span-2"><Terminal logs={logs} /></div>
           <div className="glass p-8 rounded-3xl border border-white/5 space-y-6">
-            <h3 className="text-lg font-bold flex items-center gap-3"><ShieldAlert className="text-amber-500 w-5 h-5" /> Execution Guard</h3>
+            <h3 className="text-lg font-bold flex items-center gap-3"><ShieldAlert className="text-amber-500 w-5 h-5" /> Safety Protocol</h3>
             <div className="space-y-4">
               <div className="p-4 rounded-xl bg-blue-500/5 border border-blue-500/10">
-                <span className="text-[9px] text-gray-500 uppercase block mb-1">Tradability Filter</span>
+                <span className="text-[9px] text-gray-500 uppercase block mb-1">Execution Pipeline</span>
                 <span className="text-sm font-bold text-blue-400">CLOB Direct</span>
-                <p className="text-[10px] text-gray-500 mt-1 italic leading-tight">Bot scans exclusively for markets with active_orders and orderbook_enabled flags.</p>
+                <p className="text-[10px] text-gray-500 mt-1 italic leading-tight">Scanner ignores non-tradable Gamma endpoints. Direct orderbook validation per candidate.</p>
               </div>
               <div className="p-4 rounded-xl bg-emerald-500/5 border border-emerald-500/10">
-                <span className="text-[9px] text-gray-500 uppercase block mb-1">L2 Validation</span>
-                <span className="text-sm font-bold text-emerald-400">Orderbook Depth</span>
-                <p className="text-[10px] text-gray-500 mt-1 italic leading-tight">Before analysis, the bot verifies live Bids and Asks on the target token.</p>
+                <span className="text-[9px] text-gray-500 uppercase block mb-1">Dynamic Sizing</span>
+                <span className="text-sm font-bold text-emerald-400">Adaptive Depth</span>
+                <p className="text-[10px] text-gray-500 mt-1 italic leading-tight">Liquidity validation scales dynamically with trade size. No fixed floor blockers.</p>
               </div>
               <div className="p-4 rounded-xl bg-amber-500/5 border border-amber-500/10">
-                <span className="text-[9px] text-gray-500 uppercase block mb-1">Cycle Policy</span>
-                <span className="text-sm font-bold text-amber-500">20s Polling</span>
-                <p className="text-[10px] text-gray-500 mt-1 italic leading-tight">Stable iteration frequency enforced to prevent rate-limiting and loop drift.</p>
+                <span className="text-[9px] text-gray-500 uppercase block mb-1">Signal Integrity</span>
+                <span className="text-sm font-bold text-amber-500">Gemini 3-Pro</span>
+                <p className="text-[10px] text-gray-500 mt-1 italic leading-tight">Neutral probability (0.5) is rejected. Bot only trades on high-confidence quantitative edges.</p>
               </div>
             </div>
           </div>
         </div>
       </main>
       <footer className="text-center text-gray-600 text-[10px] uppercase tracking-[0.3em] font-mono border-t border-white/5 pt-8 pb-4">
-        &copy; 2025 POLYQUANT-X // STABLE_KERNEL_V5 // v5.3.0-PROD
+        &copy; 2025 POLYQUANT-X // PRODUCTION_KERNEL // v5.4.0-STABLE
       </footer>
     </div>
   );

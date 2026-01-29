@@ -26,10 +26,9 @@ async function fetchWithRetry<T>(fn: () => Promise<T>, maxRetries = 3, initialDe
   throw lastError;
 }
 
-export const generateMarketSignal = async (market: Market): Promise<Signal> => {
+export const generateMarketSignal = async (market: Market): Promise<Signal | null> => {
   return fetchWithRetry(async () => {
     try {
-      // Fix: Initialize the API client directly using the environment variable as per guidelines.
       const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
 
       const prompt = `Analyze the probability of this prediction market outcome: "${market.question}".
@@ -37,7 +36,6 @@ export const generateMarketSignal = async (market: Market): Promise<Signal> => {
       Provide a quantitative probability estimate based on the latest available news and search data.
       Be objective and look for contrarian data points. Respond in JSON format.`;
 
-      // Fix: Using gemini-3-pro-preview for complex reasoning and quantitative analysis tasks.
       const response = await ai.models.generateContent({
         model: "gemini-3-pro-preview",
         contents: prompt,
@@ -65,11 +63,16 @@ export const generateMarketSignal = async (market: Market): Promise<Signal> => {
         }
       });
 
-      // Fix: Directly access .text property from GenerateContentResponse (do not use .text())
-      const text = response.text?.trim() || '{}';
+      const text = response.text?.trim();
+      if (!text) return null;
+      
       const data = JSON.parse(text);
       
-      // Extract search URLs for grounding
+      // Explicitly reject signals without a probability estimate
+      if (data.impliedProbability === undefined || data.impliedProbability === null) {
+        return null;
+      }
+
       const sources = response.candidates?.[0]?.groundingMetadata?.groundingChunks?.map((chunk: any) => ({
         title: chunk.web?.title || 'Source',
         uri: chunk.web?.uri || '#'
@@ -77,14 +80,14 @@ export const generateMarketSignal = async (market: Market): Promise<Signal> => {
 
       return {
         marketId: market.id,
-        impliedProbability: data.impliedProbability ?? 0.5,
+        impliedProbability: data.impliedProbability,
         confidence: data.confidence ?? 0.5,
-        reasoning: data.reasoning ?? 'Analysis unavailable',
+        reasoning: data.reasoning ?? 'Analysis completed',
         sources: sources
       };
     } catch (error) {
       console.error("Signal generation failed:", error);
-      throw error;
+      return null;
     }
   });
 };
