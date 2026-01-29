@@ -2,7 +2,7 @@
 import { Market, Trade, Signal, BotStats, LogEntry } from "../types";
 import { RISK_LIMITS } from "../constants";
 
-const POLYMARKET_CLOB_API = "https://clob.polymarket.com";
+const POLYMARKET_GAMMA_API = "https://gamma-api.polymarket.com";
 
 /**
  * Calculates the Expected Value (EV) of a YES position.
@@ -38,41 +38,41 @@ export const calculateKellySize = (
 };
 
 /**
- * Fetches real production market data from Polymarket CLOB.
- * Uses specific filtering for active, tradeable tokens.
+ * Fetches real production market data.
+ * Switched to Gamma API for better discovery of active, high-liquidity events.
  */
 export const fetchLiveMarkets = async (): Promise<Market[]> => {
   try {
-    // Fetch active markets with volume filtering if possible
-    const response = await fetch(`${POLYMARKET_CLOB_API}/markets?active=true`);
-    if (!response.ok) throw new Error("Failed to fetch from Polymarket CLOB API");
+    // Gamma API is more reliable for "what is tradeable now"
+    const response = await fetch(`${POLYMARKET_GAMMA_API}/markets?active=true&closed=false&limit=50&order=volume24hr&dir=desc`);
+    if (!response.ok) throw new Error("Failed to fetch from Polymarket Gamma API");
     
-    const data = await response.json();
-    const rawMarkets = data.data || [];
+    const markets = await response.json();
+    
+    if (!Array.isArray(markets)) {
+        console.warn("Gamma API returned unexpected format", markets);
+        return [];
+    }
 
-    // Filter for liquid markets (must have outcomes and be active)
-    return rawMarkets
+    return markets
       .filter((m: any) => 
         m.active === true && 
         m.closed === false &&
-        m.outcomes && 
-        m.question
+        m.question &&
+        m.outcomePrices // Ensure we have pricing data
       )
-      .sort((a: any) => (a.volume_24h ? -1 : 1)) // Prioritize high volume
-      .slice(0, 20)
       .map((m: any) => {
-        // Extract current price from the CLOB token data if available
-        // Usually YES is index 0, NO is index 1
-        const tokens = m.tokens || [];
-        const yesPrice = tokens[0]?.price ? parseFloat(tokens[0].price) : 0.5;
+        // Gamma API outcomePrices is usually an array of strings ["0.5", "0.5"]
+        const prices = JSON.parse(m.outcomePrices || "[]");
+        const yesPrice = prices[0] ? parseFloat(prices[0]) : 0.5;
 
         return {
-          id: m.condition_id || m.id,
+          id: m.conditionId || m.id,
           question: m.question,
-          category: m.group_item_title || "General",
-          volume: parseFloat(m.volume_24h || m.volume || "0"),
+          category: m.groupItemTitle || "General",
+          volume: parseFloat(m.volume24hr || "0"),
           currentPrice: yesPrice,
-          outcomes: typeof m.outcomes === 'string' ? JSON.parse(m.outcomes) : m.outcomes,
+          outcomes: m.outcomes ? (typeof m.outcomes === 'string' ? JSON.parse(m.outcomes) : m.outcomes) : ["YES", "NO"],
           lastUpdated: Date.now(),
           description: m.description || ""
         };

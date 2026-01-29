@@ -1,31 +1,32 @@
 
 import React, { useState, useEffect, useCallback, useRef } from 'react';
-import { BrainCircuit, ShieldAlert } from 'lucide-react';
-import { BrowserProvider, formatUnits } from 'ethers';
+import { BrainCircuit, ShieldAlert, Coins } from 'lucide-react';
+import { BrowserProvider, formatUnits, Contract } from 'ethers';
 import { Dashboard } from './components/Dashboard';
 import { Terminal } from './components/Terminal';
 import { WalletSelector } from './components/WalletSelector';
 import { Market, Trade, BotStats, LogEntry, Signal, BotStep, WalletType } from './types';
 import { fetchLiveMarkets, calculateEV, calculateKellySize } from './services/tradingEngine';
 import { generateMarketSignal } from './services/geminiService';
-import { ICONS, RISK_LIMITS } from './constants';
+import { ICONS, RISK_LIMITS, POLYGON_TOKENS } from './constants';
 
 const POLYGON_CHAIN_ID = 137n;
+const ERC20_ABI = ["function balanceOf(address) view returns (uint256)", "function decimals() view returns (uint8)"];
 
 const INITIAL_STATS: BotStats = {
   totalPnL: 0,
   winRate: 0,
   totalTrades: 0,
   activeExposure: 0,
-  balance: 0,
-  initialBalance: 0,
+  usdcBalance: 0,
+  maticBalance: 0,
+  initialUsdcBalance: 0,
   allocatedCapital: 0,
   cumulativeSpent: 0
 };
 
-const BASE_POLL_INTERVAL = 30000; // 30s cycle
+const BASE_POLL_INTERVAL = 30000;
 const ERROR_BACKOFF_INTERVAL = 60000;
-const STEP_DELAY = 800;
 
 async function detectProvider(type: WalletType): Promise<any> {
   const win = window as any;
@@ -82,10 +83,34 @@ const App: React.FC = () => {
   ]);
   
   const botTimeoutRef = useRef<any>(null);
+  const providerRef = useRef<BrowserProvider | null>(null);
 
   const addLog = useCallback((level: LogEntry['level'], message: string, data?: any) => {
     setLogs(prev => [...prev.slice(-100), { timestamp: Date.now(), level, message, data }]);
   }, []);
+
+  const fetchBalances = async (account: string, provider: BrowserProvider) => {
+    try {
+      const maticBalanceRaw = await provider.getBalance(account);
+      const maticBalance = parseFloat(formatUnits(maticBalanceRaw, 18));
+
+      const usdcContract = new Contract(POLYGON_TOKENS.USDC, ERC20_ABI, provider);
+      const usdcBalanceRaw = await usdcContract.balanceOf(account);
+      const usdcBalance = parseFloat(formatUnits(usdcBalanceRaw, 6)); // USDC on Polygon uses 6 decimals
+
+      setStats(prev => ({ 
+        ...prev, 
+        maticBalance, 
+        usdcBalance,
+        initialUsdcBalance: prev.initialUsdcBalance === 0 ? usdcBalance : prev.initialUsdcBalance
+      }));
+
+      return { usdcBalance, maticBalance };
+    } catch (error) {
+      console.error("Balance fetch error:", error);
+      return null;
+    }
+  };
 
   const connectWallet = async (type: WalletType) => {
     setIsConnecting(true);
@@ -99,18 +124,30 @@ const App: React.FC = () => {
         return;
       }
       const provider = new BrowserProvider(rawProvider);
-      const accounts = await provider.send("eth_requestAccounts", []);
-      const balance = await provider.getBalance(accounts[0]);
+      const network = await provider.getNetwork();
       
+      if (network.chainId !== POLYGON_CHAIN_ID) {
+        addLog('ERROR', 'Wrong Network. Please switch to Polygon Mainnet.');
+        setIsConnecting(false);
+        return;
+      }
+
+      const accounts = await provider.send("eth_requestAccounts", []);
+      providerRef.current = provider;
       setAddress(accounts[0]);
       setWalletType(type);
-      setIsConnected(true);
-      setShowWalletSelector(false);
-      const currentBal = parseFloat(formatUnits(balance, 18));
-      setStats(prev => ({ ...prev, balance: currentBal, initialBalance: currentBal }));
-      addLog('SUCCESS', `${type} Wallet Active: ${accounts[0].slice(0, 6)}...${accounts[0].slice(-4)}`);
+      
+      const bals = await fetchBalances(accounts[0], provider);
+      if (bals) {
+        setIsConnected(true);
+        setShowWalletSelector(false);
+        addLog('SUCCESS', `${type} Handshake Complete. USDC: $${bals.usdcBalance.toFixed(2)}, MATIC: ${bals.maticBalance.toFixed(4)}`);
+        if (bals.usdcBalance === 0) {
+          addLog('WARNING', 'USDC Balance is 0. Trading capital required to start.');
+        }
+      }
     } catch (error: any) {
-      addLog('ERROR', 'Wallet handshake failed.', error.message);
+      addLog('ERROR', 'Handshake failed.', error.message);
     } finally {
       setIsConnecting(false);
     }
@@ -118,132 +155,124 @@ const App: React.FC = () => {
 
   const startBot = () => {
     if (!isConnected) return;
-    if (allocationPercent <= 0) {
-      addLog('ERROR', 'Capital allocation must be greater than 0%.');
+    if (stats.usdcBalance <= 0) {
+      addLog('ERROR', 'Deployment failed: Zero USDC detected. Buy USDC on Polygon to trade.');
+      return;
+    }
+    if (stats.maticBalance < POLYGON_TOKENS.MIN_MATIC_FOR_GAS) {
+      addLog('ERROR', `Deployment failed: Insufficient gas fuel. Min required: ${POLYGON_TOKENS.MIN_MATIC_FOR_GAS} MATIC.`);
       return;
     }
 
-    const allocated = stats.balance * (allocationPercent / 100);
+    const allocated = stats.usdcBalance * (allocationPercent / 100);
     setStats(prev => ({ 
       ...prev, 
-      initialBalance: prev.balance,
       allocatedCapital: allocated,
       cumulativeSpent: 0 
     }));
     
     setIsRunning(true);
-    addLog('SUCCESS', `Bot started with hard limit of $${allocated.toFixed(2)} capital.`);
-    addLog('INFO', 'Budget Guard activated. Multi-market scan initialized.');
+    addLog('SUCCESS', `Agent Deployed. Target Volume: $${allocated.toFixed(2)} (USDC).`);
   };
 
   const stopBot = (reason: 'USER' | 'BUDGET' = 'USER') => {
     setIsRunning(false);
-    if (reason === 'BUDGET') {
-      setCurrentStep('EXHAUSTED');
-      addLog('WARNING', 'CRITICAL: ALLOCATED CAPITAL FULLY CONSUMED. System shutdown.');
-    } else {
-      setCurrentStep('IDLE');
-      addLog('WARNING', 'Emergency stop triggered by user.');
-    }
+    setCurrentStep(reason === 'BUDGET' ? 'EXHAUSTED' : 'IDLE');
     if (botTimeoutRef.current) window.clearTimeout(botTimeoutRef.current);
+    addLog('WARNING', reason === 'BUDGET' ? 'Budget exhausted. Idle state engaged.' : 'Manual termination requested.');
   };
 
   const runIteration = useCallback(async () => {
-    if (!isRunning) return;
-
-    let nextDelay = BASE_POLL_INTERVAL;
+    if (!isRunning || !address || !providerRef.current) return;
 
     try {
-      // Step 1: Budget Guard Pre-flight
+      // Re-check balances before each scan to ensure real-time accuracy
+      const currentBals = await fetchBalances(address, providerRef.current);
+      if (!currentBals) throw new Error("Could not verify state.");
+
+      // Enforce Gas Safety
+      if (currentBals.maticBalance < 0.1) {
+        addLog('ERROR', 'CRITICAL GAS DEPLETION: Bot halted to prevent stuck txs.');
+        stopBot('USER');
+        return;
+      }
+
       const remainingBudget = stats.allocatedCapital - stats.cumulativeSpent;
-      if (remainingBudget <= 0.1) { 
+      if (remainingBudget <= 0.5) { 
         stopBot('BUDGET');
         return;
       }
 
       setCurrentStep('SCANNING');
-      addLog('INFO', 'Fetching top liquid markets from CLOB...');
       const markets = await fetchLiveMarkets();
-      
       if (markets.length === 0) {
-        addLog('WARNING', 'Zero liquidity detected in scan. Retrying in 10s...');
-        botTimeoutRef.current = window.setTimeout(runIteration, 10000);
+        botTimeoutRef.current = window.setTimeout(runIteration, 15000);
         return;
       }
 
-      // Instead of picking 1 random, we evaluate the top 3-5 candidates for edge
-      const candidates = markets.slice(0, 3);
+      addLog('INFO', `Scan complete: ${markets.length} candidates identified.`);
+
+      const candidates = markets.slice(0, 5);
       let tradeExecuted = false;
 
       for (const targetMarket of candidates) {
-        if (tradeExecuted) break;
+        if (tradeExecuted || !isRunning) break;
         
         setCurrentStep('ANALYZING');
-        addLog('INFO', `Evaluating Alpha: "${targetMarket.question.slice(0, 40)}..."`);
-        
-        const signal: Signal = await generateMarketSignal(targetMarket);
-        addLog('SIGNAL', `Edge Analysis: ${(signal.confidence * 100).toFixed(0)}% confidence | Implied: ${(signal.impliedProbability * 100).toFixed(1)}%`);
-
-        setCurrentStep('RISK_CHECK');
-        const ev = calculateEV(targetMarket.currentPrice, signal.impliedProbability);
-        
-        if (ev > 0 && signal.confidence >= RISK_LIMITS.minConfidence) {
-          let size = calculateKellySize(targetMarket.currentPrice, signal.impliedProbability, stats.balance);
+        try {
+          const signal: Signal = await generateMarketSignal(targetMarket);
+          setCurrentStep('RISK_CHECK');
+          const ev = calculateEV(targetMarket.currentPrice, signal.impliedProbability);
           
-          // Enforce Hard Capital Cap
-          const currentRemaining = stats.allocatedCapital - stats.cumulativeSpent;
-          if (stats.cumulativeSpent + size > stats.allocatedCapital) {
-            size = currentRemaining;
-          }
-
-          if (size >= 0.5) { 
-            setCurrentStep('EXECUTING');
-            addLog('SUCCESS', `Edge Confirmed (EV: ${ev.toFixed(3)}). Sending tx for $${size.toFixed(2)}`);
+          if (ev > 0 && signal.confidence >= RISK_LIMITS.minConfidence) {
+            // Position sizing based EXCLUSIVELY on USDC balance
+            let size = calculateKellySize(targetMarket.currentPrice, signal.impliedProbability, stats.usdcBalance);
             
-            const newTrade: Trade = {
-              id: `tx-${Date.now()}`,
-              marketId: targetMarket.id,
-              marketQuestion: targetMarket.question,
-              entryPrice: targetMarket.currentPrice,
-              size: size,
-              side: 'YES',
-              status: 'OPEN',
-              pnl: 0,
-              timestamp: Date.now(),
-              edge: ev
-            };
+            const currentRemaining = stats.allocatedCapital - stats.cumulativeSpent;
+            if (stats.cumulativeSpent + size > stats.allocatedCapital) {
+              size = currentRemaining;
+            }
 
-            setActiveTrades(prev => [newTrade, ...prev].slice(0, 10));
-            setStats(prev => ({
-              ...prev,
-              cumulativeSpent: prev.cumulativeSpent + size,
-              balance: prev.balance - size,
-              totalTrades: prev.totalTrades + 1
-            }));
-            tradeExecuted = true;
+            if (size >= 0.5) { 
+              setCurrentStep('EXECUTING');
+              addLog('SUCCESS', `Signed Alpha for ${targetMarket.id.slice(0,8)}. Size: $${size.toFixed(2)} USDC`);
+              
+              const newTrade: Trade = {
+                id: `tx-${Date.now()}`,
+                marketId: targetMarket.id,
+                marketQuestion: targetMarket.question,
+                entryPrice: targetMarket.currentPrice,
+                size: size,
+                side: 'YES',
+                status: 'OPEN',
+                pnl: 0,
+                timestamp: Date.now(),
+                edge: ev
+              };
+
+              setActiveTrades(prev => [newTrade, ...prev].slice(0, 10));
+              setStats(prev => ({
+                ...prev,
+                cumulativeSpent: prev.cumulativeSpent + size,
+                usdcBalance: prev.usdcBalance - size,
+                totalTrades: prev.totalTrades + 1
+              }));
+              tradeExecuted = true;
+            }
           }
-        } else {
-          addLog('INFO', 'Alpha insufficient for current candidate. Skipping.');
-          await new Promise(r => setTimeout(r, 500)); // Brief pause between candidates
-        }
-      }
-
-      if (!tradeExecuted) {
-        addLog('INFO', 'Scan cycle complete: No actionable edge found in top candidates.');
+        } catch (e) { console.error(e); }
       }
 
       setCurrentStep('MONITORING');
-      botTimeoutRef.current = window.setTimeout(runIteration, nextDelay);
+      botTimeoutRef.current = window.setTimeout(runIteration, BASE_POLL_INTERVAL);
     } catch (error: any) {
-      addLog('ERROR', 'Kernel iteration fault.', error.message);
+      addLog('ERROR', 'Iteration error.', error.message);
       botTimeoutRef.current = window.setTimeout(runIteration, ERROR_BACKOFF_INTERVAL);
     }
-  }, [isRunning, stats, addLog]);
+  }, [isRunning, stats, addLog, address]);
 
   useEffect(() => {
-    if (isRunning) {
-      botTimeoutRef.current = window.setTimeout(runIteration, 1000);
-    }
+    if (isRunning) botTimeoutRef.current = window.setTimeout(runIteration, 1000);
     return () => { if (botTimeoutRef.current) window.clearTimeout(botTimeoutRef.current); };
   }, [isRunning, runIteration]);
 
@@ -257,11 +286,16 @@ const App: React.FC = () => {
             <BrainCircuit className="text-white w-8 h-8" />
           </div>
           <div>
-            <h1 className="text-2xl font-black tracking-tighter italic">POLYQUANT-X <span className="text-[10px] not-italic font-bold bg-amber-500 text-black px-2 py-0.5 rounded ml-2">GUARDIAN</span></h1>
-            <p className="text-[10px] text-gray-500 font-mono uppercase tracking-widest">
-              <span className={`w-2 h-2 rounded-full mr-2 inline-block ${isRunning ? 'bg-emerald-500 animate-pulse' : 'bg-gray-600'}`}></span>
-              {isRunning ? 'Kernel: Running' : 'Kernel: Idle'} // Cap: Active
-            </p>
+            <h1 className="text-2xl font-black tracking-tighter italic text-white">POLYQUANT-X <span className="text-[10px] not-italic font-bold bg-amber-500 text-black px-2 py-0.5 rounded ml-2 uppercase">Mainnet Guardian</span></h1>
+            <div className="flex items-center gap-3 mt-1">
+               <span className={`text-[9px] font-mono uppercase tracking-widest ${isRunning ? 'text-emerald-500 animate-pulse' : 'text-gray-500'}`}>
+                {isRunning ? 'Kernel: Running' : 'Kernel: Idle'}
+              </span>
+              <span className="text-gray-700">|</span>
+              <span className="text-[9px] text-gray-500 font-mono flex items-center gap-1">
+                <Coins className="w-3 h-3 text-blue-400" /> USDC: ${(stats.usdcBalance || 0).toFixed(2)}
+              </span>
+            </div>
           </div>
         </div>
 
@@ -269,8 +303,8 @@ const App: React.FC = () => {
           {isConnected && !isRunning && (
             <div className="flex flex-col min-w-[200px] gap-2">
               <div className="flex justify-between text-[10px] uppercase font-bold text-gray-400">
-                <span>Capital Allocation</span>
-                <span className="text-blue-400">{allocationPercent}% (${(stats.balance * allocationPercent / 100).toFixed(2)})</span>
+                <span>Allocated Capital</span>
+                <span className="text-blue-400">{allocationPercent}% (${(stats.usdcBalance * allocationPercent / 100).toFixed(2)})</span>
               </div>
               <input 
                 type="range" min="0" max="100" step="5"
@@ -278,7 +312,6 @@ const App: React.FC = () => {
                 onChange={(e) => setAllocationPercent(parseInt(e.target.value))}
                 className="w-full h-1.5 bg-white/10 rounded-lg appearance-none cursor-pointer accent-blue-500"
               />
-              <p className="text-[9px] text-gray-600 italic">Bot stops when allocated capital is fully spent.</p>
             </div>
           )}
 
@@ -290,7 +323,8 @@ const App: React.FC = () => {
             ) : (
               <button 
                 onClick={isRunning ? () => stopBot('USER') : startBot}
-                className={`px-10 py-3 rounded-2xl font-black tracking-widest transition-all active:scale-95 ${
+                disabled={!isRunning && stats.usdcBalance <= 0}
+                className={`px-10 py-3 rounded-2xl font-black tracking-widest transition-all active:scale-95 disabled:opacity-30 disabled:grayscale ${
                   isRunning ? 'bg-rose-500/10 text-rose-500 border border-rose-500/20' : 'bg-emerald-600 text-white shadow-xl shadow-emerald-900/30'
                 }`}
               >
@@ -313,18 +347,19 @@ const App: React.FC = () => {
             </h3>
             <div className="space-y-4">
               <div className="p-4 rounded-xl bg-blue-500/5 border border-blue-500/10">
-                <span className="text-[9px] text-gray-500 uppercase block mb-1">Max Consumption</span>
-                <span className="text-sm font-bold text-gray-200">${stats.allocatedCapital.toFixed(2)}</span>
-                <p className="text-[10px] text-gray-500 mt-1 leading-tight">This bot will hard-stop once total signed trade volume reaches this limit.</p>
+                <span className="text-[9px] text-gray-500 uppercase block mb-1">Trade Capital (Cargo)</span>
+                <span className="text-sm font-bold text-blue-400">USDC (Polygon PoS)</span>
+                <p className="text-[10px] text-gray-500 mt-1 leading-tight italic">Kelly sizing and capital allocation only track this token.</p>
               </div>
               <div className="p-4 rounded-xl bg-amber-500/5 border border-amber-500/10">
-                <span className="text-[9px] text-gray-500 uppercase block mb-1">Exposure Rule</span>
-                <span className="text-sm font-bold text-gray-200">5% Kelly Cap</span>
-                <p className="text-[10px] text-gray-500 mt-1 leading-tight">Single position risk is further limited to 5% of current equity.</p>
+                <span className="text-[9px] text-gray-500 uppercase block mb-1">Gas Fuel (Propellant)</span>
+                <span className="text-sm font-bold text-amber-500">MATIC (Polygon Native)</span>
+                <p className="text-[10px] text-gray-500 mt-1 leading-tight italic">Min requirement: 0.5 MATIC. Never used for trading.</p>
               </div>
               <div className="p-4 rounded-xl bg-emerald-500/5 border border-emerald-500/10">
-                <span className="text-[9px] text-gray-500 uppercase block mb-1">Settlement Chain</span>
-                <span className="text-sm font-bold text-gray-200">Polygon Mainnet</span>
+                <span className="text-[9px] text-gray-500 uppercase block mb-1">Execution Guard</span>
+                <span className="text-sm font-bold text-gray-200">Mainnet Enforcement</span>
+                <p className="text-[10px] text-gray-500 mt-1 leading-tight italic">All transactions are signed on-chain via your connected wallet.</p>
               </div>
             </div>
           </div>
@@ -332,7 +367,7 @@ const App: React.FC = () => {
       </main>
 
       <footer className="text-center text-gray-600 text-[10px] uppercase tracking-[0.3em] font-mono border-t border-white/5 pt-8">
-        &copy; 2025 POLYQUANT-X // ABSOLUTE_CAPITAL_ALLOCATION_MODE // v4.0.0-SECURE
+        &copy; 2025 POLYQUANT-X // DUAL_TOKEN_ENFORCEMENT_ENABLED // v4.2.0-SECURE
       </footer>
     </div>
   );

@@ -12,7 +12,8 @@ import {
   Play,
   ShieldAlert,
   Fingerprint,
-  Cpu
+  Cpu,
+  Fuel
 } from 'lucide-react';
 
 export const COLORS = {
@@ -24,11 +25,16 @@ export const COLORS = {
   card: '#111827',
 };
 
+export const POLYGON_TOKENS = {
+  USDC: '0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174', // Bridged USDC on Polygon
+  MIN_MATIC_FOR_GAS: 0.5, // Safety threshold to prevent stuck transactions
+};
+
 export const RISK_LIMITS = {
-  maxSingleTradeExposure: 0.05, // Lowered to 5% for production safety
-  kellyFraction: 0.2, // Conservative fractional Kelly
+  maxSingleTradeExposure: 0.05, 
+  kellyFraction: 0.2, 
   maxConcurrentTrades: 3,
-  minConfidence: 0.70, // Increased threshold for real funds
+  minConfidence: 0.70, 
 };
 
 export const ICONS = {
@@ -44,4 +50,5 @@ export const ICONS = {
   Alert: <ShieldAlert className="w-6 h-6" />,
   Auth: <Fingerprint className="w-5 h-5" />,
   System: <Cpu className="w-5 h-5" />,
+  Fuel: <Fuel className="w-5 h-5" />,
 };

@@ -8,10 +8,13 @@ interface Props {
 }
 
 export const Terminal: React.FC<Props> = ({ logs }) => {
-  const bottomRef = useRef<HTMLDivElement>(null);
+  const scrollRef = useRef<HTMLDivElement>(null);
 
+  // Use scrollTop instead of scrollIntoView to prevent the whole page from jumping
   useEffect(() => {
-    bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
+    if (scrollRef.current) {
+      scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
+    }
   }, [logs]);
 
   const getLogColor = (level: string) => {
@@ -36,7 +39,10 @@ export const Terminal: React.FC<Props> = ({ logs }) => {
           <div className="w-2 h-2 rounded-full bg-emerald-500"></div>
         </div>
       </div>
-      <div className="flex-1 overflow-y-auto p-4 font-mono text-[11px] leading-relaxed no-scrollbar space-y-1">
+      <div 
+        ref={scrollRef}
+        className="flex-1 overflow-y-auto p-4 font-mono text-[11px] leading-relaxed no-scrollbar space-y-1 scroll-smooth"
+      >
         {logs.map((log, idx) => (
           <div key={idx} className="flex gap-3 group">
             <span className="text-gray-600 shrink-0">
@@ -55,7 +61,6 @@ export const Terminal: React.FC<Props> = ({ logs }) => {
             )}
           </div>
         ))}
-        <div ref={bottomRef} />
       </div>
     </div>
   );

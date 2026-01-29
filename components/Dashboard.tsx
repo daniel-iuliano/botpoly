@@ -28,13 +28,14 @@ interface Props {
   currentStep: BotStep;
 }
 
-const StatCard = ({ title, value, icon, trend }: { title: string, value: string, icon: React.ReactNode, trend?: string }) => (
+const StatCard = ({ title, value, icon, trend, subValue }: { title: string, value: string, icon: React.ReactNode, trend?: string, subValue?: string }) => (
   <div className="glass p-5 rounded-2xl flex flex-col gap-2 relative overflow-hidden group">
     <div className="flex justify-between items-center text-gray-400">
       <span className="text-xs font-medium uppercase tracking-wider">{title}</span>
       {icon}
     </div>
     <div className="text-2xl font-bold tracking-tight group-hover:text-blue-400 transition-colors">{value}</div>
+    {subValue && <div className="text-[10px] font-mono text-gray-500">{subValue}</div>}
     {trend && (
       <div className={`text-xs font-medium ${trend.startsWith('+') ? 'text-emerald-400' : 'text-rose-400'}`}>
         {trend} vs yesterday
@@ -76,7 +77,7 @@ export const Dashboard: React.FC<Props> = ({ stats, activeTrades, currentStep })
     <div className="space-y-6">
       {/* Bot Lifecycle & Budget Progress */}
       <div className="grid grid-cols-1 lg:grid-cols-4 gap-6">
-        <div className="lg:col-span-3 glass p-6 rounded-2xl overflow-hidden relative">
+        <div className="lg:col-span-3 glass p-6 rounded-2xl overflow-hidden relative border-b-4 border-b-blue-500/20">
           <div className="flex justify-between items-center relative z-10 px-4 md:px-12">
             {steps.map((step, idx) => (
               <React.Fragment key={step.key}>
@@ -125,25 +126,27 @@ export const Dashboard: React.FC<Props> = ({ stats, activeTrades, currentStep })
 
       <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
         <StatCard 
+          title="Tradeable Capital" 
+          value={`$${stats.usdcBalance.toLocaleString()}`} 
+          subValue="USDC (Polygon)"
+          icon={ICONS.Wallet} 
+        />
+        <StatCard 
+          title="Gas Fuel" 
+          value={`${stats.maticBalance.toFixed(4)}`} 
+          subValue="MATIC (Polygon)"
+          icon={ICONS.Fuel} 
+        />
+        <StatCard 
           title="Total PnL" 
           value={`$${stats.totalPnL.toLocaleString()}`} 
           icon={ICONS.Trend} 
           trend="+12.5%" 
         />
         <StatCard 
-          title="Win Rate" 
-          value={`${(stats.winRate * 100).toFixed(1)}%`} 
-          icon={ICONS.Brain} 
-        />
-        <StatCard 
           title="Exposure" 
           value={`$${stats.activeExposure.toLocaleString()}`} 
           icon={ICONS.Shield} 
-        />
-        <StatCard 
-          title="Wallet Balance" 
-          value={`$${stats.balance.toLocaleString()}`} 
-          icon={ICONS.Wallet} 
         />
       </div>
 

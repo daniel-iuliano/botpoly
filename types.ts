@@ -40,8 +40,9 @@ export interface BotStats {
   winRate: number;
   totalTrades: number;
   activeExposure: number;
-  balance: number;
-  initialBalance: number;
+  usdcBalance: number; // Trading Capital
+  maticBalance: number; // Gas Fuel
+  initialUsdcBalance: number;
   allocatedCapital: number;
   cumulativeSpent: number;
 }
