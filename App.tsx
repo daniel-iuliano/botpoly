@@ -11,7 +11,11 @@ import { generateMarketSignal } from './services/geminiService';
 import { ICONS, RISK_LIMITS, POLYGON_TOKENS } from './constants';
 
 const POLYGON_CHAIN_ID = 137n;
-const ERC20_ABI = ["function balanceOf(address) view returns (uint256)", "function decimals() view returns (uint8)"];
+const ERC20_ABI = [
+  "function balanceOf(address) view returns (uint256)", 
+  "function decimals() view returns (uint8)",
+  "function symbol() view returns (string)"
+];
 
 const INITIAL_STATS: BotStats = {
   totalPnL: 0,
@@ -89,45 +93,71 @@ const App: React.FC = () => {
     setLogs(prev => [...prev.slice(-100), { timestamp: Date.now(), level, message, data }]);
   }, []);
 
+  /**
+   * PRODUCTION FIX: Multi-token aggregate balance detection.
+   * Checks both Native USDC and Bridged USDC on Polygon.
+   */
   const fetchBalances = async (account: string, provider: BrowserProvider) => {
     try {
+      // 1. Verify Chain is still Polygon
+      const network = await provider.getNetwork();
+      if (network.chainId !== POLYGON_CHAIN_ID) {
+        addLog('ERROR', `Network Mismatch: Detected Chain ${network.chainId}. Switch to Polygon (137).`);
+        return null;
+      }
+
+      // 2. Fetch Native Gas (MATIC)
       const maticBalanceRaw = await provider.getBalance(account);
       const maticBalance = parseFloat(formatUnits(maticBalanceRaw, 18));
 
-      const usdcContract = new Contract(POLYGON_TOKENS.USDC, ERC20_ABI, provider);
-      const usdcBalanceRaw = await usdcContract.balanceOf(account);
-      const usdcBalance = parseFloat(formatUnits(usdcBalanceRaw, 6)); // USDC on Polygon uses 6 decimals
+      // 3. Fetch USDC (Native)
+      const nativeContract = new Contract(POLYGON_TOKENS.USDC_NATIVE, ERC20_ABI, provider);
+      const rawNative = await nativeContract.balanceOf(account);
+      const nativeUsdc = parseFloat(formatUnits(rawNative, 6));
 
+      // 4. Fetch USDC (Bridged/USDC.e)
+      const bridgedContract = new Contract(POLYGON_TOKENS.USDC_BRIDGED, ERC20_ABI, provider);
+      const rawBridged = await bridgedContract.balanceOf(account);
+      const bridgedUsdc = parseFloat(formatUnits(rawBridged, 6));
+
+      const totalUsdc = nativeUsdc + bridgedUsdc;
+
+      // Log Raw Data for Transparency
+      console.debug(`[POLYGON_SCAN] Native: ${rawNative.toString()} | Bridged: ${rawBridged.toString()}`);
+      
       setStats(prev => ({ 
         ...prev, 
         maticBalance, 
-        usdcBalance,
-        initialUsdcBalance: prev.initialUsdcBalance === 0 ? usdcBalance : prev.initialUsdcBalance
+        usdcBalance: totalUsdc,
+        initialUsdcBalance: prev.initialUsdcBalance === 0 ? totalUsdc : prev.initialUsdcBalance
       }));
 
-      return { usdcBalance, maticBalance };
-    } catch (error) {
-      console.error("Balance fetch error:", error);
+      return { usdcBalance: totalUsdc, maticBalance, nativeUsdc, bridgedUsdc };
+    } catch (error: any) {
+      addLog('ERROR', 'Balance detection sequence failed.', error.message);
       return null;
     }
   };
 
   const connectWallet = async (type: WalletType) => {
     setIsConnecting(true);
-    addLog('INFO', `Scanning for ${type} provider...`);
+    addLog('INFO', `Initializing Handshake: ${type}...`);
     try {
       const rawProvider = await detectProvider(type);
       if (!rawProvider) {
-        addLog('ERROR', `${type} extension not detected or inactive.`);
+        addLog('ERROR', `${type} extension not found. Please install or unlock.`);
         setShowWalletSelector(false);
         setIsConnecting(false);
         return;
       }
+
       const provider = new BrowserProvider(rawProvider);
       const network = await provider.getNetwork();
       
+      addLog('INFO', `Verifying Settlement Chain: ${network.chainId}`);
+      
       if (network.chainId !== POLYGON_CHAIN_ID) {
-        addLog('ERROR', 'Wrong Network. Please switch to Polygon Mainnet.');
+        addLog('ERROR', `Chain ID ${network.chainId} unsupported. Switch to Polygon (137).`);
         setIsConnecting(false);
         return;
       }
@@ -141,13 +171,19 @@ const App: React.FC = () => {
       if (bals) {
         setIsConnected(true);
         setShowWalletSelector(false);
-        addLog('SUCCESS', `${type} Handshake Complete. USDC: $${bals.usdcBalance.toFixed(2)}, MATIC: ${bals.maticBalance.toFixed(4)}`);
+        addLog('SUCCESS', `Session Established: ${accounts[0].slice(0,6)}...`);
+        addLog('INFO', `Detected Liquidity: $${bals.usdcBalance.toFixed(2)} total USDC.`);
+        
+        if (bals.nativeUsdc > 0 && bals.bridgedUsdc > 0) {
+          addLog('INFO', `Aggregated $${bals.nativeUsdc.toFixed(2)} Native + $${bals.bridgedUsdc.toFixed(2)} Bridged.`);
+        }
+        
         if (bals.usdcBalance === 0) {
-          addLog('WARNING', 'USDC Balance is 0. Trading capital required to start.');
+          addLog('WARNING', 'Zero Tradeable Capital. Deposit USDC on Polygon to continue.');
         }
       }
     } catch (error: any) {
-      addLog('ERROR', 'Handshake failed.', error.message);
+      addLog('ERROR', 'Handshake aborted.', error.message);
     } finally {
       setIsConnecting(false);
     }
@@ -156,11 +192,11 @@ const App: React.FC = () => {
   const startBot = () => {
     if (!isConnected) return;
     if (stats.usdcBalance <= 0) {
-      addLog('ERROR', 'Deployment failed: Zero USDC detected. Buy USDC on Polygon to trade.');
+      addLog('ERROR', 'Cannot deploy: USDC balance is zero. Verification required.');
       return;
     }
     if (stats.maticBalance < POLYGON_TOKENS.MIN_MATIC_FOR_GAS) {
-      addLog('ERROR', `Deployment failed: Insufficient gas fuel. Min required: ${POLYGON_TOKENS.MIN_MATIC_FOR_GAS} MATIC.`);
+      addLog('ERROR', `Low Fuel: Need at least ${POLYGON_TOKENS.MIN_MATIC_FOR_GAS} MATIC.`);
       return;
     }
 
@@ -172,27 +208,26 @@ const App: React.FC = () => {
     }));
     
     setIsRunning(true);
-    addLog('SUCCESS', `Agent Deployed. Target Volume: $${allocated.toFixed(2)} (USDC).`);
+    addLog('SUCCESS', `Agent Active. Settlement Pool: $${allocated.toFixed(2)} USDC.`);
   };
 
   const stopBot = (reason: 'USER' | 'BUDGET' = 'USER') => {
     setIsRunning(false);
     setCurrentStep(reason === 'BUDGET' ? 'EXHAUSTED' : 'IDLE');
     if (botTimeoutRef.current) window.clearTimeout(botTimeoutRef.current);
-    addLog('WARNING', reason === 'BUDGET' ? 'Budget exhausted. Idle state engaged.' : 'Manual termination requested.');
+    addLog('WARNING', reason === 'BUDGET' ? 'Target reached/Budget used.' : 'Emergency shutdown executed.');
   };
 
   const runIteration = useCallback(async () => {
     if (!isRunning || !address || !providerRef.current) return;
 
     try {
-      // Re-check balances before each scan to ensure real-time accuracy
+      // Sync state before scan
       const currentBals = await fetchBalances(address, providerRef.current);
-      if (!currentBals) throw new Error("Could not verify state.");
+      if (!currentBals) throw new Error("State sync failed.");
 
-      // Enforce Gas Safety
       if (currentBals.maticBalance < 0.1) {
-        addLog('ERROR', 'CRITICAL GAS DEPLETION: Bot halted to prevent stuck txs.');
+        addLog('ERROR', 'Gas Safety Violation: Critical low MATIC.');
         stopBot('USER');
         return;
       }
@@ -210,7 +245,7 @@ const App: React.FC = () => {
         return;
       }
 
-      addLog('INFO', `Scan complete: ${markets.length} candidates identified.`);
+      addLog('INFO', `Scan: ${markets.length} liquid candidates.`);
 
       const candidates = markets.slice(0, 5);
       let tradeExecuted = false;
@@ -225,7 +260,6 @@ const App: React.FC = () => {
           const ev = calculateEV(targetMarket.currentPrice, signal.impliedProbability);
           
           if (ev > 0 && signal.confidence >= RISK_LIMITS.minConfidence) {
-            // Position sizing based EXCLUSIVELY on USDC balance
             let size = calculateKellySize(targetMarket.currentPrice, signal.impliedProbability, stats.usdcBalance);
             
             const currentRemaining = stats.allocatedCapital - stats.cumulativeSpent;
@@ -235,7 +269,7 @@ const App: React.FC = () => {
 
             if (size >= 0.5) { 
               setCurrentStep('EXECUTING');
-              addLog('SUCCESS', `Signed Alpha for ${targetMarket.id.slice(0,8)}. Size: $${size.toFixed(2)} USDC`);
+              addLog('SUCCESS', `Executing Alpha: ${targetMarket.id.slice(0,8)}. Size: $${size.toFixed(2)}`);
               
               const newTrade: Trade = {
                 id: `tx-${Date.now()}`,
@@ -266,7 +300,7 @@ const App: React.FC = () => {
       setCurrentStep('MONITORING');
       botTimeoutRef.current = window.setTimeout(runIteration, BASE_POLL_INTERVAL);
     } catch (error: any) {
-      addLog('ERROR', 'Iteration error.', error.message);
+      addLog('ERROR', 'Kernel Fault.', error.message);
       botTimeoutRef.current = window.setTimeout(runIteration, ERROR_BACKOFF_INTERVAL);
     }
   }, [isRunning, stats, addLog, address]);
@@ -286,14 +320,14 @@ const App: React.FC = () => {
             <BrainCircuit className="text-white w-8 h-8" />
           </div>
           <div>
-            <h1 className="text-2xl font-black tracking-tighter italic text-white">POLYQUANT-X <span className="text-[10px] not-italic font-bold bg-amber-500 text-black px-2 py-0.5 rounded ml-2 uppercase">Mainnet Guardian</span></h1>
+            <h1 className="text-2xl font-black tracking-tighter italic text-white">POLYQUANT-X <span className="text-[10px] not-italic font-bold bg-amber-500 text-black px-2 py-0.5 rounded ml-2 uppercase tracking-widest">Mainnet Verified</span></h1>
             <div className="flex items-center gap-3 mt-1">
                <span className={`text-[9px] font-mono uppercase tracking-widest ${isRunning ? 'text-emerald-500 animate-pulse' : 'text-gray-500'}`}>
                 {isRunning ? 'Kernel: Running' : 'Kernel: Idle'}
               </span>
               <span className="text-gray-700">|</span>
               <span className="text-[9px] text-gray-500 font-mono flex items-center gap-1">
-                <Coins className="w-3 h-3 text-blue-400" /> USDC: ${(stats.usdcBalance || 0).toFixed(2)}
+                <Coins className="w-3 h-3 text-blue-400" /> USDC Pool: ${(stats.usdcBalance || 0).toFixed(2)}
               </span>
             </div>
           </div>
@@ -343,23 +377,23 @@ const App: React.FC = () => {
           </div>
           <div className="glass p-8 rounded-3xl border border-white/5 space-y-6">
             <h3 className="text-lg font-bold flex items-center gap-3">
-              <ShieldAlert className="text-amber-500 w-5 h-5" /> Safety Protocols
+              <ShieldAlert className="text-amber-500 w-5 h-5" /> Mainnet Safety
             </h3>
             <div className="space-y-4">
               <div className="p-4 rounded-xl bg-blue-500/5 border border-blue-500/10">
-                <span className="text-[9px] text-gray-500 uppercase block mb-1">Trade Capital (Cargo)</span>
-                <span className="text-sm font-bold text-blue-400">USDC (Polygon PoS)</span>
-                <p className="text-[10px] text-gray-500 mt-1 leading-tight italic">Kelly sizing and capital allocation only track this token.</p>
+                <span className="text-[9px] text-gray-500 uppercase block mb-1">Detected Cargo</span>
+                <span className="text-sm font-bold text-blue-400">Multi-USDC Aggregation</span>
+                <p className="text-[10px] text-gray-500 mt-1 leading-tight italic">Detecting both Native (Circle) and Bridged (USDC.e) tokens on Polygon PoS.</p>
               </div>
               <div className="p-4 rounded-xl bg-amber-500/5 border border-amber-500/10">
-                <span className="text-[9px] text-gray-500 uppercase block mb-1">Gas Fuel (Propellant)</span>
-                <span className="text-sm font-bold text-amber-500">MATIC (Polygon Native)</span>
-                <p className="text-[10px] text-gray-500 mt-1 leading-tight italic">Min requirement: 0.5 MATIC. Never used for trading.</p>
+                <span className="text-[9px] text-gray-500 uppercase block mb-1">Fuel Gauge</span>
+                <span className="text-sm font-bold text-amber-500">MATIC Verification</span>
+                <p className="text-[10px] text-gray-500 mt-1 leading-tight italic">Active chain monitoring prevents stuck txs during high congestion.</p>
               </div>
               <div className="p-4 rounded-xl bg-emerald-500/5 border border-emerald-500/10">
-                <span className="text-[9px] text-gray-500 uppercase block mb-1">Execution Guard</span>
-                <span className="text-sm font-bold text-gray-200">Mainnet Enforcement</span>
-                <p className="text-[10px] text-gray-500 mt-1 leading-tight italic">All transactions are signed on-chain via your connected wallet.</p>
+                <span className="text-[9px] text-gray-500 uppercase block mb-1">Network Enforcement</span>
+                <span className="text-sm font-bold text-gray-200">Polygon Chain 137</span>
+                <p className="text-[10px] text-gray-500 mt-1 leading-tight italic">Cross-chain safety: Handshake is rejected if wallet is on Ethereum or other chains.</p>
               </div>
             </div>
           </div>
@@ -367,7 +401,7 @@ const App: React.FC = () => {
       </main>
 
       <footer className="text-center text-gray-600 text-[10px] uppercase tracking-[0.3em] font-mono border-t border-white/5 pt-8">
-        &copy; 2025 POLYQUANT-X // DUAL_TOKEN_ENFORCEMENT_ENABLED // v4.2.0-SECURE
+        &copy; 2025 POLYQUANT-X // MULTI_TOKEN_AGGREGATION_V2 // v4.3.0-PROD
       </footer>
     </div>
   );

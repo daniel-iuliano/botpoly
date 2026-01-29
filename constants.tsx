@@ -26,8 +26,10 @@ export const COLORS = {
 };
 
 export const POLYGON_TOKENS = {
-  USDC: '0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174', // Bridged USDC on Polygon
-  MIN_MATIC_FOR_GAS: 0.5, // Safety threshold to prevent stuck transactions
+  // Common error: Only checking one version of USDC. We must check both.
+  USDC_NATIVE: '0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359', // Native USDC (Circle)
+  USDC_BRIDGED: '0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174', // Bridged USDC (USDC.e)
+  MIN_MATIC_FOR_GAS: 0.5, 
 };
 
 export const RISK_LIMITS = {
