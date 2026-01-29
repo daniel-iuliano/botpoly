@@ -1,0 +1,5 @@
+{
+  "name": "PolyQuant-X Autonomous Trader",
+  "description": "A high-performance autonomous trading system for Polymarket utilizing Bayesian probability, Kelly sizing, and Gemini-driven sentiment analysis for edge detection.",
+  "requestFramePermissions": []
+}
