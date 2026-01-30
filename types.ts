@@ -3,6 +3,29 @@ export type BotStep = 'IDLE' | 'SCANNING' | 'ANALYZING' | 'RISK_CHECK' | 'EXECUT
 
 export type WalletType = 'METAMASK' | 'PHANTOM' | 'TRUST' | 'WALLETCONNECT';
 
+export interface BotConfig {
+  // Market Filters
+  minLiquidityMultiplier: number;
+  maxSpread: number;
+  binaryOnly: boolean;
+  
+  // Signal & Edge
+  minEV: number;
+  minConfidence: number;
+  onMissingSignal: 'SKIP' | 'RETRY';
+  
+  // Risk & Sizing
+  kellyMultiplier: number;
+  minTradeSize: number;
+  maxTradeSize: number;
+  maxExposurePerTrade: number;
+  cooldownSeconds: number;
+  
+  // Scanner
+  scanIntervalSeconds: number;
+  maxMarketsPerScan: number;
+}
+
 export interface Market {
   id: string; // conditionId
   question: string;

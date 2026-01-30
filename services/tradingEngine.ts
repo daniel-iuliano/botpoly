@@ -1,6 +1,5 @@
 
-import { Market, Orderbook, Signal } from "../types";
-import { RISK_LIMITS } from "../constants";
+import { Market, Orderbook, Signal, BotConfig } from "../types";
 
 const POLYMARKET_CLOB_API = "https://clob.polymarket.com";
 
@@ -12,7 +11,8 @@ export const calculateEV = (marketPrice: number, estimatedProb: number): number 
 export const calculateKellySize = (
   marketPrice: number, 
   estimatedProb: number, 
-  balance: number
+  balance: number,
+  config: BotConfig
 ): number => {
   if (marketPrice <= 0 || marketPrice >= 1) return 0;
   const b = (1 / marketPrice) - 1; 
@@ -21,15 +21,16 @@ export const calculateKellySize = (
   const kellyFraction = (b * p - q) / b;
   if (kellyFraction <= 0) return 0;
   
-  const adjustedFraction = kellyFraction * RISK_LIMITS.kellyFraction;
-  const size = balance * Math.min(adjustedFraction, RISK_LIMITS.maxSingleTradeExposure);
-  return size;
+  const adjustedFraction = kellyFraction * config.kellyMultiplier;
+  const size = balance * Math.min(adjustedFraction, config.maxExposurePerTrade);
+  
+  return Math.min(size, config.maxTradeSize);
 };
 
 /**
  * PRODUCTION SCANNER: Strict Layer 1 Discovery.
  */
-export const fetchLiveMarkets = async (): Promise<{ 
+export const fetchLiveMarkets = async (config: BotConfig): Promise<{ 
   markets: Market[], 
   stats: { total: number, discarded: number, tradable: number } 
 }> => {
@@ -55,13 +56,16 @@ export const fetchLiveMarkets = async (): Promise<{
       }
 
       if (m.condition_id && Array.isArray(m.tokens) && m.tokens.length >= 1) {
-        // ROBUST TOKEN SELECTION: 
-        // 1. Try common 'positive' labels
-        // 2. Fallback to first available token (guarantees we never have empty ID for tradable market)
         const yesToken = m.tokens.find((t: any) => 
           ['yes', 'true', 'will happen', 'hit', 'over'].includes(t.outcome?.toLowerCase())
-        ) || m.tokens[0];
+        );
 
+        if (config.binaryOnly && !yesToken) {
+           discarded++;
+           continue;
+        }
+
+        const fallbackYes = yesToken || m.tokens[0];
         const noToken = m.tokens.find((t: any) => 
           ['no', 'false', 'will not happen', 'miss', 'under'].includes(t.outcome?.toLowerCase())
         ) || m.tokens[1] || m.tokens[0];
@@ -75,7 +79,7 @@ export const fetchLiveMarkets = async (): Promise<{
           outcomes: m.tokens.map((t: any) => t.outcome),
           lastUpdated: Date.now(),
           description: m.description || m.question,
-          yesTokenId: yesToken.token_id,
+          yesTokenId: fallbackYes.token_id,
           noTokenId: noToken.token_id,
           acceptingOrders: true,
           enableOrderBook: true
@@ -118,19 +122,16 @@ export const fetchOrderbook = async (tokenId: string): Promise<Orderbook | null>
  * Validates if the orderbook can support the intended trade size.
  * @param book The orderbook object
  * @param tradeSize The intended trade amount in USDC
- * @param multiplier Safety buffer for liquidity (default 1.5x trade size)
+ * @param config Bot configuration containing multiplier and max spread
  */
-export const validateLiquidity = (book: Orderbook, tradeSize: number, multiplier = 1.5): boolean => {
-  // Spread check: Reject highly illiquid/manipulated spreads
-  if (book.spread > 0.08) return false; 
+export const validateLiquidity = (book: Orderbook, tradeSize: number, config: BotConfig): boolean => {
+  if (book.spread > config.maxSpread) return false; 
   
   let availableDepth = 0;
-  // Calculate aggregate depth at top levels
   for (let i = 0; i < Math.min(book.asks.length, 5); i++) {
     availableDepth += parseFloat(book.asks[i].size) * parseFloat(book.asks[i].price);
   }
   
-  // Depth must support the trade size with a safety buffer
-  const requiredDepth = tradeSize * multiplier;
+  const requiredDepth = tradeSize * config.minLiquidityMultiplier;
   return availableDepth >= requiredDepth; 
 };

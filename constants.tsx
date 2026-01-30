@@ -13,8 +13,13 @@ import {
   ShieldAlert,
   Fingerprint,
   Cpu,
-  Fuel
+  Fuel,
+  Settings2,
+  Filter,
+  BarChart3,
+  Scale
 } from 'lucide-react';
+import { BotConfig } from './types';
 
 export const COLORS = {
   primary: '#3b82f6',
@@ -26,10 +31,25 @@ export const COLORS = {
 };
 
 export const POLYGON_TOKENS = {
-  // Common error: Only checking one version of USDC. We must check both.
-  USDC_NATIVE: '0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359', // Native USDC (Circle)
-  USDC_BRIDGED: '0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174', // Bridged USDC (USDC.e)
+  USDC_NATIVE: '0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359',
+  USDC_BRIDGED: '0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174',
   MIN_MATIC_FOR_GAS: 0.5, 
+};
+
+export const DEFAULT_CONFIG: BotConfig = {
+  minLiquidityMultiplier: 1.5,
+  maxSpread: 0.05,
+  binaryOnly: false,
+  minEV: 0.01,
+  minConfidence: 0.70,
+  onMissingSignal: 'SKIP',
+  kellyMultiplier: 0.2,
+  minTradeSize: 1.0,
+  maxTradeSize: 50.0,
+  maxExposurePerTrade: 0.05,
+  cooldownSeconds: 30,
+  scanIntervalSeconds: 30,
+  maxMarketsPerScan: 3
 };
 
 export const RISK_LIMITS = {
@@ -53,4 +73,8 @@ export const ICONS = {
   Auth: <Fingerprint className="w-5 h-5" />,
   System: <Cpu className="w-5 h-5" />,
   Fuel: <Fuel className="w-5 h-5" />,
+  Config: <Settings2 className="w-5 h-5" />,
+  Filter: <Filter className="w-4 h-4" />,
+  Stats: <BarChart3 className="w-4 h-4" />,
+  Scale: <Scale className="w-4 h-4" />,
 };
