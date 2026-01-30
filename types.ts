@@ -3,7 +3,13 @@ export type BotStep = 'IDLE' | 'SCANNING' | 'ANALYZING' | 'RISK_CHECK' | 'EXECUT
 
 export type WalletType = 'METAMASK' | 'PHANTOM' | 'TRUST' | 'WALLETCONNECT';
 
+export type ExecutionMode = 'SIMULATION' | 'LIVE';
+export type PresetType = 'SAFE' | 'OPTIMAL' | 'FAST' | 'AGGRESSIVE' | 'SLOW' | 'DEBUG';
+
 export interface BotConfig {
+  mode: ExecutionMode;
+  preset: PresetType | null;
+  
   // Market Filters
   minLiquidityMultiplier: number;
   maxSpread: number;
@@ -26,8 +32,23 @@ export interface BotConfig {
   maxMarketsPerScan: number;
 }
 
+export interface SimulationStats {
+  scans: number;
+  validSignals: number;
+  simulatedTrades: number;
+  pnl: number;
+  maxDrawdown: number;
+  blockedReasons: {
+    spread: number;
+    liquidity: number;
+    confidence: number;
+    ev: number;
+    size: number;
+  };
+}
+
 export interface Market {
-  id: string; // conditionId
+  id: string;
   question: string;
   category: string;
   volume: number;
@@ -35,10 +56,8 @@ export interface Market {
   outcomes: string[];
   lastUpdated: number;
   description: string;
-  // CLOB Specific
   yesTokenId: string;
   noTokenId: string;
-  rewards?: boolean;
   acceptingOrders: boolean;
   enableOrderBook: boolean;
 }
@@ -61,6 +80,7 @@ export interface Trade {
   pnl: number;
   timestamp: number;
   edge: number;
+  isSimulated?: boolean;
 }
 
 export interface Signal {
