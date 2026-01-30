@@ -133,8 +133,8 @@ export const Dashboard: React.FC<Props> = ({ stats, activeTrades, currentStep })
         />
         <StatCard 
           title="Gas Fuel" 
-          value={`${stats.maticBalance.toFixed(4)}`} 
-          subValue="MATIC (Polygon)"
+          value={`${stats.polBalance.toFixed(4)}`} 
+          subValue="POL (Polygon)"
           icon={ICONS.Fuel} 
         />
         <StatCard 

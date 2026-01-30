@@ -12,7 +12,7 @@ export async function startBot(
   config: BotConfig, 
   address: string | null,
   onTrade: (trade: Trade) => void,
-  onIterationComplete: (balances: { usdc: number, matic: number }) => void
+  onIterationComplete: (balances: { usdc: number, pol: number }) => void
 ) {
   if (running) return;
   running = true;
@@ -24,20 +24,16 @@ export async function startBot(
     if (!running) return;
 
     try {
+      // Fetch real-time balances before every iteration
       const balances = await getBalances(address);
       onIterationComplete(balances);
 
-      if (balances.usdc <= 0 && ACTIVE_CONFIG.mode === 'LIVE') {
-        log.error("Insufficient USDC for live trading. Halting.");
-        running = false;
-        return;
-      }
-
-      const newTrades = await runIteration(balances.usdc);
+      // Core decision loop
+      const newTrades = await runIteration(balances.usdc, address);
       newTrades.forEach(onTrade);
 
     } catch (e: any) {
-      log.error(`Engine Fault: ${e.message}`);
+      log.error(`Engine Loop Fault: ${e.message}`);
     } finally {
       if (running) {
         loopTimeout = setTimeout(loop, ACTIVE_CONFIG.scanIntervalSeconds * 1000);
@@ -50,6 +46,9 @@ export async function startBot(
 
 export function stopBot() {
   running = false;
-  if (loopTimeout) clearTimeout(loopTimeout);
+  if (loopTimeout) {
+    clearTimeout(loopTimeout);
+    loopTimeout = null;
+  }
   log.info("Backend Engine Halted.");
 }

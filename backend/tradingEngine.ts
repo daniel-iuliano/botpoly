@@ -7,7 +7,7 @@ import { ACTIVE_CONFIG } from "./config";
 import { generateMarketSignal } from "../services/geminiService";
 import { Trade } from "../types";
 
-export async function runIteration(balance: number): Promise<Trade[]> {
+export async function runIteration(balance: number, address: string | null): Promise<Trade[]> {
   const candidates = await scanMarkets();
   const executedTrades: Trade[] = [];
 
@@ -17,7 +17,6 @@ export async function runIteration(balance: number): Promise<Trade[]> {
       continue;
     }
 
-    // Call Gemini for alpha
     log.info(`Analyzing ${market.id.slice(0,8)} with Gemini...`);
     const signal = await generateMarketSignal(market);
     if (!signal) continue;
@@ -36,11 +35,12 @@ export async function runIteration(balance: number): Promise<Trade[]> {
       continue;
     }
 
-    const trade = await executeOrder(market, book, size, ev);
-    executedTrades.push(trade);
-    
-    // Break after first execution to avoid overlapping orders in a single scan
-    break; 
+    const trade = await executeOrder(market, book, size, ev, address);
+    if (trade) {
+      executedTrades.push(trade);
+      // In production, we typically wait for the fill before taking more positions
+      break; 
+    }
   }
 
   return executedTrades;

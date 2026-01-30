@@ -97,7 +97,7 @@ export interface BotStats {
   totalTrades: number;
   activeExposure: number;
   usdcBalance: number;
-  maticBalance: number;
+  polBalance: number; // Updated from maticBalance
   initialUsdcBalance: number;
   allocatedCapital: number;
   cumulativeSpent: number;

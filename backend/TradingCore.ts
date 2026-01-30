@@ -160,7 +160,8 @@ export class TradingCore {
   // Used by UI to simulate balance updates or gas
   updateBalances(usdc: number, matic: number) {
     this.stats.usdcBalance = usdc;
-    this.stats.maticBalance = matic;
+    // Fix: Updated maticBalance to polBalance to match the interface property name in types.ts
+    this.stats.polBalance = matic;
     if (this.stats.initialUsdcBalance === 0) {
       this.stats.initialUsdcBalance = usdc;
     }
